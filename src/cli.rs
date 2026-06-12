@@ -73,8 +73,8 @@ pub struct RunweaverCliRuntime<'ports, 'config> {
     pub compile_binary: &'ports dyn for<'request> Fn(
         CompileRunweaverBinaryRequest<'request>,
     ) -> Result<CompileRunweaverBinaryResult>,
-    pub generated_surface_files: &'ports dyn Fn() -> Vec<GeneratedSurfaceFile>,
-    pub git_surface: &'ports dyn Fn() -> Option<GitSurfaceManifest>,
+    pub generated_surface_files: &'ports dyn Fn() -> Result<Vec<GeneratedSurfaceFile>>,
+    pub git_surface: &'ports dyn Fn() -> Result<Option<GitSurfaceManifest>>,
 }
 
 pub struct LoadRunweaverConfigRequest<'a> {
@@ -398,8 +398,8 @@ pub fn run_compiled_runweaver_project_cli_with_compile<'config>(
             anyhow!("Compiled Runweaver CLI was called without compiled agent hook config.")
         })
     };
-    let generated_surface_files = || project.generated_surface_files().to_vec();
-    let git_surface = || project.git_surface().cloned();
+    let generated_surface_files = || Ok(project.generated_surface_files().to_vec());
+    let git_surface = || Ok(project.git_surface().cloned());
 
     run_runweaver_cli(
         &args,
@@ -431,8 +431,8 @@ pub fn run_compiled_runweaver_cli_with_compile<'config>(
             anyhow!("Compiled Runweaver CLI was called without compiled agent hook config.")
         })
     };
-    let generated_surface_files = Vec::new;
-    let git_surface = || None;
+    let generated_surface_files = || Ok(Vec::new());
+    let git_surface = || Ok(None);
 
     run_runweaver_cli(
         &args,
@@ -440,6 +440,98 @@ pub fn run_compiled_runweaver_cli_with_compile<'config>(
             load_runweaver_config: &load_config,
             load_agent_hooks_config: &load_hooks,
             compile_binary,
+            generated_surface_files: &generated_surface_files,
+            git_surface: &git_surface,
+        },
+        io,
+    )
+}
+
+/// Loads a project for the generic `runweaver` binary: reads
+/// `.runweaver/manifest.json` under `root` and resolves it against the
+/// library's [`default_builtin_registry`](crate::config::default_builtin_registry).
+/// Manifests that reference builtins outside the default registry fail fast
+/// with a pointer to project-specific binaries.
+pub fn load_generic_runweaver_project(root: &Path) -> Result<CompiledRunweaverProject<'static>> {
+    let manifest_path = root.join(".runweaver/manifest.json");
+    let content = std::fs::read_to_string(&manifest_path).map_err(|error| {
+        anyhow!(
+            "Failed to read Runweaver manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: RunweaverDefinitionManifest =
+        serde_json::from_str(&content).map_err(|error| {
+            anyhow!(
+                "Failed to parse Runweaver manifest JSON {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+    let loaded = crate::config::load_runweaver_manifest(
+        &manifest,
+        &crate::config::default_builtin_registry(),
+        &crate::config::generic_runweaver_project_binary(),
+    )
+    .map_err(|error| match error {
+        crate::config::ManifestLoadError::UnknownBuiltins(builtins) => anyhow!(
+            "Runweaver manifest {} references builtins missing from the generic runweaver registry:\n{builtins}\nThis manifest requires a project-specific runweaver binary that registers those builtins.",
+            manifest_path.display()
+        ),
+        other => anyhow!(other),
+    })?;
+    let mut builder = compiled_runweaver_project(loaded.definition);
+    if let Some(agent_hooks) = loaded.agent_hooks {
+        builder = builder.agent_hooks_config(agent_hooks);
+    }
+    Ok(builder
+        .build()
+        .with_generated_surface_files(loaded.generated_surface_files)
+        .with_surfaces(loaded.surfaces))
+}
+
+/// CLI entry point for the generic `runweaver` binary: every command that
+/// needs project config loads `.runweaver/manifest.json` with the default
+/// builtin registry; manifest-free commands (`init`, `manifest`, ...) run
+/// without one.
+pub fn run_generic_runweaver_cli(args: &[String], io: RunweaverCliIo<'_>) -> Result<i32> {
+    let options = parse_runweaver_options(args.get(1..).unwrap_or_default())?;
+    let root = absolute_path(options.cwd.as_deref().unwrap_or("."));
+
+    let load_config = |request: LoadRunweaverConfigRequest<'_>| {
+        Ok(load_generic_runweaver_project(request.cwd)?
+            .runweaver_config()
+            .clone())
+    };
+    let load_hooks = |request: LoadRunweaverAgentHooksConfigRequest<'_>| {
+        load_generic_runweaver_project(request.root)?
+            .agent_hooks_config()
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!("The Runweaver manifest does not configure a surfaces.agents entry.")
+            })
+    };
+    let compile_binary = |_request: CompileRunweaverBinaryRequest<'_>| {
+        Err(anyhow!(
+            "The generic runweaver binary cannot compile a project binary; add a project-specific Rust crate that embeds the runweaver library."
+        ))
+    };
+    let generated_surface_files = || {
+        Ok(load_generic_runweaver_project(&root)?
+            .generated_surface_files()
+            .to_vec())
+    };
+    let git_surface = || {
+        Ok(load_generic_runweaver_project(&root)?
+            .git_surface()
+            .cloned())
+    };
+
+    run_runweaver_cli(
+        &compiled_cli_args(args),
+        RunweaverCliRuntime {
+            load_runweaver_config: &load_config,
+            load_agent_hooks_config: &load_hooks,
+            compile_binary: &compile_binary,
             generated_surface_files: &generated_surface_files,
             git_surface: &git_surface,
         },
@@ -676,7 +768,7 @@ fn run_sync(
             return Ok(1);
         }
     }
-    for file in (runtime.generated_surface_files)() {
+    for file in (runtime.generated_surface_files)()? {
         write_generated_surface_file(cwd, &file)?;
         writeln!(io.stdout, "Wrote {}", file.path)?;
     }
@@ -696,7 +788,7 @@ fn run_check_hooks(
 ) -> Result<i32> {
     let agent_exit_code =
         run_agent_hooks_config_command(AgentHooksConfigCommand::Check, cwd, options, runtime, io)?;
-    let generated_files = (runtime.generated_surface_files)();
+    let generated_files = (runtime.generated_surface_files)()?;
     let generated_mismatches = check_generated_surface_files(cwd, &generated_files)?;
     if generated_mismatches.is_empty() {
         if !generated_files.is_empty() {
@@ -920,7 +1012,7 @@ fn run_git_hook(
         writeln!(io.stderr, "Missing git hook slot.")?;
         return Ok(1);
     };
-    let Some(git) = (runtime.git_surface)() else {
+    let Some(git) = (runtime.git_surface)()? else {
         writeln!(io.stderr, "No surfaces.git manifest is configured.")?;
         return Ok(1);
     };
@@ -1558,12 +1650,12 @@ mod tests {
         )
     }
 
-    fn empty_generated_surface_files() -> Vec<GeneratedSurfaceFile> {
-        Vec::new()
+    fn empty_generated_surface_files() -> Result<Vec<GeneratedSurfaceFile>> {
+        Ok(Vec::new())
     }
 
-    fn empty_git_surface() -> Option<GitSurfaceManifest> {
-        None
+    fn empty_git_surface() -> Result<Option<GitSurfaceManifest>> {
+        Ok(None)
     }
 
     fn run_git(root: &Path, args: &[&str]) {

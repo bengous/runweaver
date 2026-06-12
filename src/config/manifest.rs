@@ -38,6 +38,23 @@ pub struct RunweaverProjectBinary {
     pub hooks_config_name: String,
     /// Loader-free fallback command prefix.
     pub fallback_command: String,
+    /// Binary invocation used in generated agent hook command prefixes
+    /// (for example `./.runweaver/bin/demo`, or `runweaver` from PATH).
+    pub hook_bin: String,
+}
+
+/// The identity the generic `runweaver` binary uses when loading a project
+/// manifest: generated surfaces invoke `runweaver` from PATH and fall back
+/// to a project-compiled binary at `.runweaver/bin/runweaver` when present.
+pub fn generic_runweaver_project_binary() -> RunweaverProjectBinary {
+    RunweaverProjectBinary {
+        package: "runweaver".to_owned(),
+        binary_name: "runweaver".to_owned(),
+        out_path: ".runweaver/bin/runweaver".to_owned(),
+        hooks_config_name: "runweaver-hooks".to_owned(),
+        fallback_command: "runweaver".to_owned(),
+        hook_bin: "runweaver".to_owned(),
+    }
 }
 
 /// The serializable, closure-free form of a definition: path zones, tools,
@@ -1114,7 +1131,7 @@ fn agents_surface_to_agent_hooks_manifest(
                 command_prefix: agent_hook_command_prefix(
                     &harness.id,
                     harness.agents_surface.command_cwd.clone(),
-                    &project_binary.out_path,
+                    &project_binary.hook_bin,
                 ),
                 options: harness.agents_surface.target_options.clone(),
             })
@@ -1186,13 +1203,11 @@ fn binding(
 fn agent_hook_command_prefix(
     harness: &str,
     cwd: crate::surfaces::agent_hooks::RunweaverHookCommandCwd,
-    out_path: &str,
+    hook_bin: &str,
 ) -> String {
     crate::surfaces::agent_hooks::compiled_runweaver_hook_command(
         &crate::surfaces::agent_hooks::CompiledRunweaverHookCommandOptions::new(
-            harness,
-            cwd,
-            format!("./{out_path}"),
+            harness, cwd, hook_bin,
         ),
     )
     .unwrap_or_else(|error| panic!("Invalid compiled hook command prefix: {error}"))
@@ -1997,6 +2012,7 @@ mod tests {
             out_path: ".runweaver/bin/demo".to_owned(),
             hooks_config_name: "demo-hooks".to_owned(),
             fallback_command: "cargo run --quiet -p demo-rs --".to_owned(),
+            hook_bin: "./.runweaver/bin/demo".to_owned(),
         }
     }
 

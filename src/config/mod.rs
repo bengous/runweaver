@@ -65,8 +65,8 @@ pub use manifest::{
     RUNWEAVER_DEFINITION_MANIFEST_VERSION, RunweaverDefinitionManifest,
     RunweaverOperationDefinitionManifest, RunweaverProjectBinary, SurfacesManifest,
     ToolDefinitionManifest, ToolTargetsManifest, create_runweaver_definition_manifest,
-    default_builtin_registry, load_runweaver_definition, load_runweaver_manifest,
-    runweaver_manifest_json_schema, runweaver_manifest_schema_content,
+    default_builtin_registry, generic_runweaver_project_binary, load_runweaver_definition,
+    load_runweaver_manifest, runweaver_manifest_json_schema, runweaver_manifest_schema_content,
     runweaver_manifest_schema_sha256, write_runweaver_manifest, write_runweaver_manifest_schema,
 };
 pub use runweaver::{
