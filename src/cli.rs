@@ -34,8 +34,9 @@ use crate::config::declarative::{
     AgentHooksConfigBuilder, agent_hooks_config as build_agent_hooks_config,
 };
 use crate::config::{
-    GeneratedSurfaceFile, GitFilesScopeManifest, GitSurfaceManifest, RunweaverConfig,
-    RunweaverDefinition, RunweaverDefinitionManifest, SurfacesManifest, TaskRun, TaskRunStatus,
+    GENERATED_GIT_HOOKS_DIR, GeneratedSurfaceFile, GitFilesScopeManifest, GitSurfaceManifest,
+    RunweaverConfig, RunweaverDefinition, RunweaverDefinitionManifest, SurfacesManifest, TaskRun,
+    TaskRunStatus,
 };
 use crate::diagnostics::{RunweaverDiagnosticsError, format_diagnostics, has_error_diagnostics};
 use crate::embedded::RunweaverBinaryManifest;
@@ -768,13 +769,21 @@ fn run_sync(
             return Ok(1);
         }
     }
-    for file in (runtime.generated_surface_files)()? {
-        write_generated_surface_file(cwd, &file)?;
+    let generated_files = (runtime.generated_surface_files)()?;
+    for file in &generated_files {
+        write_generated_surface_file(cwd, file)?;
         writeln!(io.stdout, "Wrote {}", file.path)?;
     }
     let mut exit_code =
         run_agent_hooks_config_command(AgentHooksConfigCommand::Sync, cwd, options, runtime, io)?;
     if exit_code != 0 {
+        exit_code = 1;
+    }
+    let hooks_path_problems = check_git_hooks_path(cwd, &generated_files)?;
+    for problem in &hooks_path_problems {
+        writeln!(io.stderr, "{problem}")?;
+    }
+    if !hooks_path_problems.is_empty() {
         exit_code = 1;
     }
     Ok(exit_code)
@@ -799,11 +808,18 @@ fn run_check_hooks(
             writeln!(io.stderr, "Generated surface file drifted: {path}")?;
         }
     }
-    Ok(if agent_exit_code == 0 && generated_mismatches.is_empty() {
-        0
-    } else {
-        1
-    })
+    let hooks_path_problems = check_git_hooks_path(cwd, &generated_files)?;
+    for problem in &hooks_path_problems {
+        writeln!(io.stderr, "{problem}")?;
+    }
+    Ok(
+        if agent_exit_code == 0 && generated_mismatches.is_empty() && hooks_path_problems.is_empty()
+        {
+            0
+        } else {
+            1
+        },
+    )
 }
 
 /// Reads an authored Runweaver manifest JSON document from CLI stdin, validates
@@ -1262,6 +1278,63 @@ fn check_generated_surface_files(
     Ok(mismatches)
 }
 
+/// Verifies git will actually execute the generated git hooks in this
+/// worktree: the effective hooks directory (honoring `core.hooksPath`,
+/// including worktree-local config) must contain every generated hook with the
+/// generated content. Git silently skips all hooks when `core.hooksPath`
+/// points at a missing directory, so a stale value disables them without any
+/// signal. Returns one problem string per broken hook; empty when no git hooks
+/// are generated or `cwd` is not inside a git repository.
+fn check_git_hooks_path(cwd: &Path, files: &[GeneratedSurfaceFile]) -> Result<Vec<String>> {
+    let prefix = format!("{GENERATED_GIT_HOOKS_DIR}/");
+    let git_hooks = files
+        .iter()
+        .filter(|file| file.path.starts_with(&prefix))
+        .collect::<Vec<_>>();
+    if git_hooks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(hooks_dir) = effective_git_hooks_dir(cwd)? else {
+        return Ok(Vec::new());
+    };
+    let mut problems = Vec::new();
+    for file in git_hooks {
+        let name = file.path.rsplit('/').next().unwrap_or(&file.path);
+        match std::fs::read_to_string(hooks_dir.join(name)) {
+            Ok(actual) if actual == file.content => {}
+            Ok(_) => problems.push(format!(
+                "Git hook {name} in effective hooks directory {} does not match generated {} — git runs the stale copy.",
+                hooks_dir.display(),
+                file.path
+            )),
+            Err(_) => problems.push(format!(
+                "Git hook {name} is missing from effective hooks directory {} — git silently skips it. Fix: git config core.hooksPath {GENERATED_GIT_HOOKS_DIR}",
+                hooks_dir.display()
+            )),
+        }
+    }
+    Ok(problems)
+}
+
+/// Resolves the hooks directory git uses for `cwd`, honoring `core.hooksPath`.
+/// Returns `None` when `cwd` is not inside a git repository.
+fn effective_git_hooks_dir(cwd: &Path) -> Result<Option<PathBuf>> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "hooks"])
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| anyhow!("Failed to run git rev-parse --git-path hooks: {error}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    Ok(Some(if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }))
+}
+
 fn set_executable_if_needed(path: &Path, executable: bool) -> Result<()> {
     if !executable {
         return Ok(());
@@ -1652,6 +1725,44 @@ mod tests {
 
     fn empty_generated_surface_files() -> Result<Vec<GeneratedSurfaceFile>> {
         Ok(Vec::new())
+    }
+
+    fn git_hook_surface_files() -> Result<Vec<GeneratedSurfaceFile>> {
+        Ok(vec![GeneratedSurfaceFile {
+            path: format!("{GENERATED_GIT_HOOKS_DIR}/pre-commit"),
+            content: "#!/usr/bin/env sh\nexit 0\n".to_owned(),
+            executable: true,
+        }])
+    }
+
+    fn run_git_hooks_cli(root: &Path, argv: &[&str], captured: &mut CapturedIo) -> Result<i32> {
+        let config = runweaver_config();
+        let hooks = agent_hooks_config();
+        let load_config = |_request: LoadRunweaverConfigRequest<'_>| Ok(config.clone());
+        let load_hooks = |_request: LoadRunweaverAgentHooksConfigRequest<'_>| Ok(hooks.clone());
+        let compile = |_request: CompileRunweaverBinaryRequest<'_>| {
+            Ok(CompileRunweaverBinaryResult {
+                outfile: root.join(".runweaver/bin/runweaver"),
+                manifest: manifest(0),
+            })
+        };
+        let argv = argv
+            .iter()
+            .copied()
+            .chain(["--config", "runweaver.config.ts"])
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        run_runweaver_cli(
+            &argv,
+            RunweaverCliRuntime {
+                load_runweaver_config: &load_config,
+                load_agent_hooks_config: &load_hooks,
+                compile_binary: &compile,
+                generated_surface_files: &git_hook_surface_files,
+                git_surface: &empty_git_surface,
+            },
+            captured.io(""),
+        )
     }
 
     fn empty_git_surface() -> Result<Option<GitSurfaceManifest>> {
@@ -2275,6 +2386,96 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&hook.stdout()).unwrap(),
             serde_json::json!({ "status": "block", "reason": "blocked rm -rf node_modules" })
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sync_hooks_skips_hooks_path_check_outside_a_git_repository() {
+        let root = temp_root("hookspath-no-repo");
+        let mut captured = CapturedIo::new();
+
+        let exit_code = run_git_hooks_cli(
+            &root,
+            &["sync", "hooks", "--cwd", root.to_str().unwrap()],
+            &mut captured,
+        )
+        .unwrap();
+
+        assert_eq!(exit_code, 0, "stderr={}", captured.stderr());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sync_hooks_fails_when_git_would_silently_skip_generated_hooks() {
+        let root = temp_root("hookspath-unset");
+        run_git(&root, &["init", "-q"]);
+        let mut captured = CapturedIo::new();
+
+        let exit_code = run_git_hooks_cli(
+            &root,
+            &["sync", "hooks", "--cwd", root.to_str().unwrap()],
+            &mut captured,
+        )
+        .unwrap();
+
+        assert_eq!(exit_code, 1);
+        assert!(
+            captured
+                .stderr()
+                .contains("git config core.hooksPath .runweaver/git-hooks"),
+            "stderr should explain the fix: {}",
+            captured.stderr()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sync_hooks_passes_when_core_hooks_path_points_at_generated_hooks() {
+        let root = temp_root("hookspath-set");
+        run_git(&root, &["init", "-q"]);
+        run_git(&root, &["config", "core.hooksPath", ".runweaver/git-hooks"]);
+        let mut captured = CapturedIo::new();
+
+        let exit_code = run_git_hooks_cli(
+            &root,
+            &["sync", "hooks", "--cwd", root.to_str().unwrap()],
+            &mut captured,
+        )
+        .unwrap();
+
+        assert_eq!(exit_code, 0, "stderr={}", captured.stderr());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn check_hooks_fails_when_core_hooks_path_is_stale() {
+        let root = temp_root("hookspath-stale");
+        run_git(&root, &["init", "-q"]);
+        run_git(&root, &["config", "core.hooksPath", ".runweave/git-hooks"]);
+        let mut sync = CapturedIo::new();
+        run_git_hooks_cli(
+            &root,
+            &["sync", "hooks", "--cwd", root.to_str().unwrap()],
+            &mut sync,
+        )
+        .unwrap();
+        let mut check = CapturedIo::new();
+
+        let exit_code = run_git_hooks_cli(
+            &root,
+            &["check", "hooks", "--cwd", root.to_str().unwrap()],
+            &mut check,
+        )
+        .unwrap();
+
+        assert_eq!(exit_code, 1);
+        assert!(
+            check
+                .stderr()
+                .contains("missing from effective hooks directory"),
+            "stderr should name the silent skip: {}",
+            check.stderr()
         );
         fs::remove_dir_all(root).unwrap();
     }

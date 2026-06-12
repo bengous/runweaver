@@ -464,6 +464,10 @@ pub struct GeneratedSurfaceFile {
     pub executable: bool,
 }
 
+/// Directory (relative to the project root) where generated git hooks are
+/// written. Projects point `core.hooksPath` here so git executes them.
+pub const GENERATED_GIT_HOOKS_DIR: &str = ".runweaver/git-hooks";
+
 /// Projects a definition into its pure-data manifest shape (closures are
 /// represented by name/presence only, never serialized).
 pub fn create_runweaver_definition_manifest(
@@ -1866,7 +1870,7 @@ fn render_git_hook_files(
 
 fn git_hook_file(name: &str, content: String) -> GeneratedSurfaceFile {
     GeneratedSurfaceFile {
-        path: format!(".runweaver/git-hooks/{name}"),
+        path: format!("{GENERATED_GIT_HOOKS_DIR}/{name}"),
         content,
         executable: true,
     }
