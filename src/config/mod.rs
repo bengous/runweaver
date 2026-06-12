@@ -66,7 +66,8 @@ pub use manifest::{
     RunweaverOperationDefinitionManifest, RunweaverProjectBinary, SurfacesManifest,
     ToolDefinitionManifest, ToolTargetsManifest, create_runweaver_definition_manifest,
     load_runweaver_definition, load_runweaver_manifest, runweaver_manifest_json_schema,
-    write_runweaver_manifest, write_runweaver_manifest_schema,
+    runweaver_manifest_schema_content, runweaver_manifest_schema_sha256, write_runweaver_manifest,
+    write_runweaver_manifest_schema,
 };
 pub use runweaver::{
     RunweaverDefinition, RunweaverDefinitionBuilder, RunweaverOperationDefinition,

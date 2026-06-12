@@ -55,6 +55,11 @@ use crate::toolchain::{
     ScaffoldActionStatus, install_managed_toolchain, scaffold_runweaver_project,
 };
 
+/// TypeScript declarations for [`RunweaverDefinitionManifest`], generated from
+/// the manifest JSON schema and embedded so `manifest types` works without a
+/// TypeScript toolchain. Regenerate with `scripts/generate-manifest-types.sh`.
+const MANIFEST_TYPES_DTS: &str = include_str!("../assets/manifest.d.ts");
+
 /// Loader and compiler ports the CLI dispatches through, decoupling command
 /// handling from how a project sources its config.
 pub struct RunweaverCliRuntime<'ports, 'config> {
@@ -554,7 +559,7 @@ pub fn parse_runweaver_options(args: &[String]) -> Result<RunweaverParsedOptions
 }
 
 pub fn runweaver_help_text() -> &'static str {
-    "runweaver <command>\n\nCommands:\n  init                Scaffold .runweaver/ managed toolchain files\n  install             Install .runweaver/package.json\n  check               Validate compiled config, scaffold, and managed toolchain\n  check hooks         Check generated native agent/git hook config drift\n  check manifest      Check .runweaver/manifest.json drift from stdin JSON\n  compile binary      Compile config + agent hooks into a project binary\n  sync hooks          Write generated native agent/git hook configs\n  sync manifest       Write .runweaver/manifest.json from stdin JSON\n  git-hook <slot>     Execute a configured Git hook slot\n  hook <harness> <command>\n                      Execute a configured agent hook command from stdin\n  run <task>          Execute a named task or tool\n\nOptions:\n  --cwd <path>        Project root\n  --config <path>     Config path relative to cwd\n  --export <name>     Agent-hook config export for hook/sync/check hooks\n  --json[=compact|full]\n                      Print machine-readable JSON. Compact hides successful output.\n  --verbose           Include successful task stdout/stderr. With --json, emit full JSON.\n  --input-json <json|->\n                      Set ExecutionContext.input from a JSON string or stdin.\n  --out <path>        Output path for compile binary. Defaults to .runweaver/bin/runweaver.\n  --fingerprint <path>\n                      Add a source root to compiled binary freshness checks.\n  --file <path>       Add one ExecutionContext file\n  --files <paths>     Add comma-separated ExecutionContext files\n"
+    "runweaver <command>\n\nCommands:\n  init                Scaffold .runweaver/ managed toolchain files\n  install             Install .runweaver/package.json\n  check               Validate compiled config, scaffold, and managed toolchain\n  check hooks         Check generated native agent/git hook config drift\n  check manifest      Check .runweaver/manifest.json drift from stdin JSON\n  compile binary      Compile config + agent hooks into a project binary\n  sync hooks          Write generated native agent/git hook configs\n  sync manifest       Write .runweaver/manifest.json from stdin JSON\n  manifest schema     Write .runweaver/manifest.schema.json\n  manifest types      Write .runweaver/manifest.d.ts TypeScript declarations\n  git-hook <slot>     Execute a configured Git hook slot\n  hook <harness> <command>\n                      Execute a configured agent hook command from stdin\n  run <task>          Execute a named task or tool\n\nOptions:\n  --cwd <path>        Project root\n  --config <path>     Config path relative to cwd\n  --export <name>     Agent-hook config export for hook/sync/check hooks\n  --json[=compact|full]\n                      Print machine-readable JSON. Compact hides successful output.\n  --verbose           Include successful task stdout/stderr. With --json, emit full JSON.\n  --input-json <json|->\n                      Set ExecutionContext.input from a JSON string or stdin.\n  --out <path>        Output path for compile binary. Defaults to .runweaver/bin/runweaver.\n  --fingerprint <path>\n                      Add a source root to compiled binary freshness checks.\n  --file <path>       Add one ExecutionContext file\n  --files <paths>     Add comma-separated ExecutionContext files\n"
 }
 
 fn run_runweaver_cli_inner(
@@ -576,6 +581,7 @@ fn run_runweaver_cli_inner(
             _ => run_check(&cwd, &options, &runtime, io),
         },
         Some("sync") => run_sync(&cwd, &options, &runtime, io),
+        Some("manifest") => run_manifest(&cwd, &options, io),
         Some("git-hook") => run_git_hook(&cwd, &options, &runtime, io),
         Some("hook") => run_hook(&cwd, &options, &runtime, io),
         Some("run") => run_named(&cwd, &options, runtime, io),
@@ -772,6 +778,37 @@ fn run_check_manifest(cwd: &Path, io: &mut RunweaverCliIo<'_>) -> Result<i32> {
 
 fn manifest_artifact_path(cwd: &Path) -> PathBuf {
     cwd.join(".runweaver/manifest.json")
+}
+
+fn run_manifest(
+    cwd: &Path,
+    options: &RunweaverParsedOptions,
+    io: &mut RunweaverCliIo<'_>,
+) -> Result<i32> {
+    let target = options.positionals.first().map(String::as_str);
+    let (relative_path, content) = match target {
+        Some("schema") => (
+            ".runweaver/manifest.schema.json",
+            crate::config::runweaver_manifest_schema_content()?,
+        ),
+        Some("types") => (".runweaver/manifest.d.ts", MANIFEST_TYPES_DTS.to_owned()),
+        _ => {
+            write!(
+                io.stderr,
+                "Unknown runweaver manifest target: {}\n{}",
+                target.unwrap_or(""),
+                runweaver_help_text()
+            )?;
+            return Ok(1);
+        }
+    };
+    let path = cwd.join(relative_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, content)?;
+    writeln!(io.stdout, "Wrote {relative_path}")?;
+    Ok(0)
 }
 
 fn stable_json_value(value: &serde_json::Value) -> serde_json::Value {
@@ -2279,6 +2316,89 @@ mod tests {
                 .contains("Failed to read current Runweaver manifest artifact")
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runweaver_cli_manifest_schema_writes_schema_artifact() {
+        let root = temp_root("manifest-schema");
+        let mut captured = CapturedIo::new();
+
+        let exit_code = run_manifest_cli(
+            &root,
+            &["manifest", "schema", "--cwd", root.to_str().unwrap()],
+            "",
+            &mut captured,
+        )
+        .unwrap();
+
+        assert_eq!(exit_code, 0);
+        let schema: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join(".runweaver/manifest.schema.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            schema.get("title").and_then(serde_json::Value::as_str),
+            Some("RunweaverDefinitionManifest")
+        );
+        assert_eq!(captured.stdout(), "Wrote .runweaver/manifest.schema.json\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runweaver_cli_manifest_types_writes_embedded_declarations() {
+        let root = temp_root("manifest-types");
+        let mut captured = CapturedIo::new();
+
+        let exit_code = run_manifest_cli(
+            &root,
+            &["manifest", "types", "--cwd", root.to_str().unwrap()],
+            "",
+            &mut captured,
+        )
+        .unwrap();
+
+        assert_eq!(exit_code, 0);
+        let types = fs::read_to_string(root.join(".runweaver/manifest.d.ts")).unwrap();
+        assert!(types.contains("export interface RunweaverDefinitionManifest"));
+        assert!(types.contains("schema-sha256: "));
+        assert_eq!(captured.stdout(), "Wrote .runweaver/manifest.d.ts\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runweaver_cli_manifest_rejects_unknown_subcommand() {
+        let root = temp_root("manifest-unknown");
+        let mut captured = CapturedIo::new();
+
+        let exit_code = run_manifest_cli(
+            &root,
+            &["manifest", "bogus", "--cwd", root.to_str().unwrap()],
+            "",
+            &mut captured,
+        )
+        .unwrap();
+
+        assert_eq!(exit_code, 1);
+        assert!(
+            captured
+                .stderr()
+                .contains("Unknown runweaver manifest target: bogus")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn embedded_manifest_types_are_generated_from_current_schema() {
+        let stamped = MANIFEST_TYPES_DTS
+            .lines()
+            .find_map(|line| line.split("schema-sha256: ").nth(1))
+            .expect("embedded manifest.d.ts should carry a schema-sha256 stamp");
+
+        assert_eq!(
+            stamped,
+            crate::config::runweaver_manifest_schema_sha256(),
+            "assets/manifest.d.ts is stale; regenerate it with scripts/generate-manifest-types.sh"
+        );
     }
 
     #[test]

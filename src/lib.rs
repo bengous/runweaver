@@ -120,7 +120,8 @@ pub use config::{
     harness_ref, hook_app, hook_command, hook_command_ref, host_command, is_blocking_completion,
     load_runweaver_definition, load_runweaver_manifest, normalize_file_path, operation_ref,
     parallel, parallel_with, parallel_with_options, policy, policy_ref, project,
-    runweaver_manifest_json_schema, series, series_with, series_with_options, skip,
+    runweaver_manifest_json_schema, runweaver_manifest_schema_content,
+    runweaver_manifest_schema_sha256, series, series_with, series_with_options, skip,
     skip_with_reason, task_ref, tool, tool_ref, validate_config, validate_project,
     validate_runweaver_definition, write_runweaver_manifest, write_runweaver_manifest_schema,
 };

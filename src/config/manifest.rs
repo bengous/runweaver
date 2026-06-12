@@ -553,10 +553,21 @@ pub fn runweaver_manifest_json_schema() -> serde_json::Value {
         .unwrap_or_else(|_| serde_json::json!({}))
 }
 
+pub fn runweaver_manifest_schema_content() -> Result<String, ManifestLoadError> {
+    serde_json::to_string_pretty(&runweaver_manifest_json_schema())
+        .map(|content| content + "\n")
+        .map_err(|error| ManifestLoadError::SchemaSerialize(error.to_string()))
+}
+
+pub fn runweaver_manifest_schema_sha256() -> String {
+    use sha2::{Digest, Sha256};
+    let content = runweaver_manifest_schema_content().unwrap_or_default();
+    format!("{:x}", Sha256::digest(content.as_bytes()))
+}
+
 pub fn write_runweaver_manifest_schema(path: &Path) -> Result<(), ManifestLoadError> {
-    let content = serde_json::to_string_pretty(&runweaver_manifest_json_schema())
-        .map_err(|error| ManifestLoadError::SchemaSerialize(error.to_string()))?;
-    std::fs::write(path, content + "\n").map_err(|error| ManifestLoadError::Io {
+    let content = runweaver_manifest_schema_content()?;
+    std::fs::write(path, content).map_err(|error| ManifestLoadError::Io {
         path: path.display().to_string(),
         message: error.to_string(),
     })
