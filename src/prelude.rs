@@ -33,12 +33,12 @@ pub use crate::config::{
     RunweaverDefinitionValidation, RunweaverOperationDefinitionManifest, RunweaverProjectBinary,
     SurfacesManifest, TaskCompletion, TaskDefinition, TaskOutput, ToolConfig,
     ToolDefinitionManifest, ToolTargetsManifest, allow, create_runweaver_definition_manifest,
-    define_config_with, define_runweaver_with, deny, error_codes, error_otherwise,
-    file_target_policy, file_targets, harness_ref, hook_command_ref, load_runweaver_definition,
-    load_runweaver_manifest, policy_ref, project, runweaver_manifest_json_schema, skip,
-    skip_with_reason, success_codes, task_ref, tool_error_codes, tool_error_otherwise, tool_ref,
-    validate_runweaver_definition, warning_codes, write_runweaver_manifest,
-    write_runweaver_manifest_schema,
+    default_builtin_registry, define_config_with, define_runweaver_with, deny, error_codes,
+    error_otherwise, file_target_policy, file_targets, harness_ref, hook_command_ref,
+    load_runweaver_definition, load_runweaver_manifest, policy_ref, project,
+    runweaver_manifest_json_schema, skip, skip_with_reason, success_codes, task_ref,
+    tool_error_codes, tool_error_otherwise, tool_ref, validate_runweaver_definition, warning_codes,
+    write_runweaver_manifest, write_runweaver_manifest_schema,
 };
 pub use crate::runtime::{
     RunweaverOperationRunError, RunweaverOperationRunResult, run_bound_runweaver_operation,

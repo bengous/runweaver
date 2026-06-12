@@ -395,6 +395,25 @@ impl BuiltinRegistry {
     }
 }
 
+/// The registry shipped with the generic `runweaver` binary: the built-in
+/// `claude` and `codex` harnesses plus the `guardDestructive` hook command.
+/// Manifests that reference anything else need a project-specific binary.
+pub fn default_builtin_registry() -> BuiltinRegistry {
+    BuiltinRegistry::new()
+        .harness(
+            crate::surfaces::agent_hooks::BuiltInHarnessName::Claude.as_str(),
+            crate::surfaces::agent_hooks::claude_harness(),
+        )
+        .harness(
+            crate::surfaces::agent_hooks::BuiltInHarnessName::Codex.as_str(),
+            crate::surfaces::agent_hooks::codex_harness(),
+        )
+        .hook_command(
+            "guardDestructive",
+            crate::surfaces::agent_hooks::guard_destructive,
+        )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ManifestLoadError {
     #[error("Unsupported Runweaver manifest version {actual}; expected {expected}.")]
@@ -2530,6 +2549,88 @@ mod tests {
             ])),
             HookOutcome::Block { ref reason, .. } if reason.contains("Read-only path zone vendor/reference/")
         ));
+    }
+
+    #[test]
+    fn default_builtin_registry_resolves_built_in_harnesses_and_destructive_guard() {
+        let manifest = RunweaverDefinitionManifest {
+            version: RUNWEAVER_DEFINITION_MANIFEST_VERSION,
+            paths: None,
+            tools: BTreeMap::new(),
+            pipelines: BTreeMap::new(),
+            operations: BTreeMap::new(),
+            surfaces: Some(SurfacesManifest {
+                agents: Some(AgentsSurfaceManifest {
+                    harnesses: vec!["claude".to_owned(), "codex".to_owned()],
+                    pre_tool: vec![AgentsPreToolGuardManifest::Builtin {
+                        guard: AgentsBuiltinGuardManifest::DestructiveCommands,
+                    }],
+                    post_edit: None,
+                    stop: None,
+                }),
+                git: None,
+                ci: None,
+                cli: None,
+            }),
+            bindings: Vec::new(),
+        };
+
+        let loaded = load_runweaver_manifest(
+            &manifest,
+            &default_builtin_registry(),
+            &test_project_binary(),
+        )
+        .expect("default registry should resolve built-in harnesses and guard");
+        let hooks = loaded.agent_hooks.expect("hooks should be present");
+
+        let mut destructive_event = hook_event(&[]);
+        destructive_event.tool_name = Some("Bash".to_owned());
+        destructive_event.tool_command = Some("git reset --hard".to_owned());
+        for harness in ["claude", "codex"] {
+            let command = hooks
+                .app
+                .command("guard-destructive", harness)
+                .expect("guard-destructive should be bound");
+            assert!(matches!(
+                command.run(&destructive_event).unwrap(),
+                HookOutcome::Block { ref reason, .. } if reason.contains("git reset --hard")
+            ));
+        }
+    }
+
+    #[test]
+    fn default_builtin_registry_reports_unknown_builtins_for_custom_harnesses() {
+        let manifest = RunweaverDefinitionManifest {
+            version: RUNWEAVER_DEFINITION_MANIFEST_VERSION,
+            paths: None,
+            tools: BTreeMap::new(),
+            pipelines: BTreeMap::new(),
+            operations: BTreeMap::new(),
+            surfaces: Some(SurfacesManifest {
+                agents: Some(AgentsSurfaceManifest {
+                    harnesses: vec!["claude".to_owned(), "fixture".to_owned()],
+                    pre_tool: Vec::new(),
+                    post_edit: None,
+                    stop: None,
+                }),
+                git: None,
+                ci: None,
+                cli: None,
+            }),
+            bindings: Vec::new(),
+        };
+
+        let error = load_runweaver_manifest(
+            &manifest,
+            &default_builtin_registry(),
+            &test_project_binary(),
+        )
+        .expect_err("custom harness should be reported as missing builtin");
+
+        assert_eq!(
+            error,
+            ManifestLoadError::UnknownBuiltins("  - harness: fixture".to_owned())
+        );
     }
 
     #[test]

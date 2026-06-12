@@ -65,6 +65,7 @@ pub mod built_in_harnesses;
 pub mod codecs;
 pub mod command_prefix;
 pub mod contract;
+pub mod destructive_commands;
 pub mod failure;
 pub mod harness;
 pub mod harness_hook_config;
@@ -102,6 +103,10 @@ pub use command_prefix::{
 };
 pub use contract::{
     HookEmission, HookEnv, HookEvent, HookOutcome, HookRequest, HookStage, UpdatedFileSnapshot,
+};
+pub use destructive_commands::{
+    DESTRUCTIVE_COMMAND_MERGE_HINT, check_destructive_command, check_destructive_merge,
+    guard_destructive, guard_destructive_command,
 };
 pub use failure::hook_failure_reason;
 pub use harness::{
