@@ -177,15 +177,6 @@ mod tests {
 
     #[test]
     fn runweaver_hook_command_renders_current_agent_hook_prefixes() {
-        let pi = runweaver_hook_command(
-            &RunweaverHookCommandOptions::new(
-                "pi",
-                RunweaverHookCommandCwd::Env("PI_PROJECT_DIR".to_owned()),
-                "runweaver.config.ts",
-            )
-            .with_export_name("agentHooksConfig"),
-        )
-        .unwrap();
         let codex = runweaver_hook_command(
             &RunweaverHookCommandOptions::new(
                 "codex",
@@ -205,10 +196,6 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            pi,
-            "cd \"$PI_PROJECT_DIR\" && ./node_modules/.bin/runweaver hook pi --config runweaver.config.ts --export agentHooksConfig"
-        );
         assert_eq!(
             codex,
             "cd \"$(git rev-parse --show-toplevel)\" && ./node_modules/.bin/runweaver hook codex --config runweaver.config.ts --export agentHooksConfig"
@@ -271,8 +258,8 @@ mod tests {
     #[test]
     fn runweaver_hook_command_rejects_invalid_env_and_empty_fields() {
         let invalid_env = runweaver_hook_command(&RunweaverHookCommandOptions::new(
-            "pi",
-            RunweaverHookCommandCwd::Env("PI PROJECT DIR".to_owned()),
+            "fixture",
+            RunweaverHookCommandCwd::Env("FIXTURE PROJECT DIR".to_owned()),
             "runweaver.config.ts",
         ))
         .unwrap_err();
@@ -285,7 +272,7 @@ mod tests {
 
         assert_eq!(
             invalid_env.to_string(),
-            "Runweaver hook command env name must be a shell variable identifier: PI PROJECT DIR"
+            "Runweaver hook command env name must be a shell variable identifier: FIXTURE PROJECT DIR"
         );
         assert_eq!(
             empty_harness.to_string(),

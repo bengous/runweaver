@@ -1,7 +1,7 @@
 # Runweaver
 
 Runweaver declares a project's quality tooling once and consumes it everywhere
-the project needs enforcement: agent hooks for Claude, Codex, and Pi, Git
+the project needs enforcement: agent hooks for Claude, Codex, and custom harnesses, Git
 hooks, CI workflows, and command-line entrypoints.
 
 The crate is a Rust library and generic binary foundation for project quality

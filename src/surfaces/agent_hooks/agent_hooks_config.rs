@@ -292,6 +292,9 @@ mod tests {
                     Ok(format!("{:?}", hook_groups_by_stage(input.groups)))
                 },
             ),
+            agents_surface: crate::surfaces::agent_hooks::AgentsSurfaceDefaults::new(
+                crate::surfaces::agent_hooks::RunweaverHookCommandCwd::None,
+            ),
         })
     }
 

@@ -1334,6 +1334,9 @@ mod tests {
                 ".codex/config.toml",
                 |_input: HarnessHookConfigRenderInput<'_>| Ok("hooks\n".to_owned()),
             ),
+            agents_surface: crate::surfaces::agent_hooks::AgentsSurfaceDefaults::new(
+                crate::surfaces::agent_hooks::RunweaverHookCommandCwd::None,
+            ),
         })
     }
 

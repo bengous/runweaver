@@ -29,7 +29,7 @@
  *
  *   claude post-edit  -> updatedToolOutput snapshot of the reformatted file
  *   codex  pre-tool   -> block with reason
- *   pi     stop       -> block session until validation passes
+ *   custom stop       -> block session until validation passes
  *   git    pre-commit -> abort commit (fixed files re-staged in fix mode)
  *   ci     PR         -> failing check with inline annotations
  *   cli               -> exit code + human-readable report
@@ -59,12 +59,12 @@ export default defineRunweaver({
       "crates/",
       ".runweaver/project-specific/",
       ".claude/",
-      ".pi/",
+      ".custom/",
       ".agents/",
       "runweaver.config.ts",
     ],
     checkOnly: [".codex/"],
-    generated: ["settings.managed.json", ".pi/hooks.jsonc", ".codex/config.toml"],
+    generated: ["settings.managed.json", ".custom/hooks.jsonc", ".codex/config.toml"],
     readOnly: ["vendor/reference/"],
   },
 
@@ -127,7 +127,7 @@ export default defineRunweaver({
     },
     lintAudit: { script: "bun .runweaver/project-specific/audits/audit-oxlint-rules.ts" },
     validatePush: { script: "bun .runweaver/project-specific/validation/validate-push.ts" },
-    installPiConfig: { script: "bun platform/cli/install-pi-config-after-commit.ts" },
+    installAgentConfig: { script: "bun platform/cli/install-agent-config-after-commit.ts" },
     mcpUpdates: { script: "bun .runweaver/project-specific/audits/check-mcp-updates.ts" },
   },
 
@@ -152,13 +152,13 @@ export default defineRunweaver({
     //  - session state: touched paths accumulated across edits
     //  - stop semantics: validation scoped to session touched paths, proved
     //    read-only via git fingerprint, runs only after relevant changes
-    //  - emission of .pi/hooks.jsonc, .codex/config.toml, .claude/settings.json
+    //  - emission of .custom/hooks.jsonc, .codex/config.toml, .claude/settings.json
     //    via `runweaver sync`, with a per-harness capability loss report
     //  - binary path / cwd env-var plumbing (today: 3 commandPrefix constants)
     // Implicit, derived from `paths`: edit-zone guards on every harness that
     // supports pre-tool blocking.
     agents: {
-      harnesses: ["pi", "codex", "claude"],
+      harnesses: ["custom", "codex", "claude"],
       preTool: [{ guard: "destructive-commands" }],
       postEdit: { run: "autofix", timeout: 90 },
       stop: { run: "validate", timeout: 240 },
@@ -174,7 +174,7 @@ export default defineRunweaver({
       commitMsg: { tool: "commitlint" },
       prePush: { run: "validatePush" },
       // ⚠ single consumer — pending user arbitrage.
-      postCommit: { tool: "installPiConfig" },
+      postCommit: { tool: "installAgentConfig" },
     },
 
     // Same `validate` pipeline, projected as PR annotations.
@@ -229,7 +229,7 @@ export default defineRunweaver({
  *    keeps the lib tool-agnostic: presets are conveniences, not privileges.
  *    Every rung is pure data — the config serializes to the manifest as-is.
  * 3. Uniform guards vs today's asymmetry: current config binds edit guards on
- *    pi+codex only and reference-repo guards on pi only. Target derives
+ *    two harnesses only and reference-repo guards on one only. Target derives
  *    guards from zones and applies them wherever the harness supports
  *    pre-tool blocking. The asymmetry is treated as accidental complexity —
  *    verify nothing relied on it before cutover.

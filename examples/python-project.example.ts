@@ -95,7 +95,7 @@ export default defineRunweaver({
   // ── Surfaces ──────────────────────────────────────────────────────────────
   surfaces: {
     // Subset of harnesses — proves the list is config, not a constant.
-    // No pi on this project. No `overrides` needed (counts against it).
+    // No custom harness on this project. No `overrides` needed (counts against it).
     agents: {
       harnesses: ["claude", "codex"],
       preTool: [{ guard: "destructive-commands" }, { guard: "secrets", tool: "gitleaks" }],

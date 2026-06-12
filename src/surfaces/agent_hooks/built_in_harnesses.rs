@@ -1,5 +1,6 @@
 use super::codecs::{ClaudeCodec, CodexCodec};
-use super::harness::{Harness, HarnessDefinition, define_harness};
+use super::command_prefix::RunweaverHookCommandCwd;
+use super::harness::{AgentsSurfaceDefaults, Harness, HarnessDefinition, define_harness};
 use super::harness_hook_config::{claude_harness_hook_config, codex_harness_hook_config};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +26,11 @@ pub fn codex_harness() -> Harness<'static> {
         id: BuiltInHarnessName::Codex.as_str().to_owned(),
         codec: &CODEX_CODEC,
         hook_config: codex_harness_hook_config(),
+        agents_surface: AgentsSurfaceDefaults::new(RunweaverHookCommandCwd::GitRoot)
+            .with_target_option("features", serde_json::json!({ "hooks": true }))
+            .with_bash_tool_matcher("^Bash$")
+            .with_edit_tool_matcher("^(apply_patch|Edit|Write|MultiEdit)$")
+            .with_stop_status("Running Codex validation"),
     })
 }
 
@@ -33,6 +39,18 @@ pub fn claude_harness() -> Harness<'static> {
         id: BuiltInHarnessName::Claude.as_str().to_owned(),
         codec: &CLAUDE_CODEC,
         hook_config: claude_harness_hook_config(),
+        agents_surface: AgentsSurfaceDefaults::new(RunweaverHookCommandCwd::Env(
+            "CLAUDE_PROJECT_DIR".to_owned(),
+        ))
+        .with_target_option(
+            "worktreeSymlinkDirectories",
+            serde_json::json!(["node_modules"]),
+        )
+        .with_edit_tool_matcher("Edit|Write|MultiEdit")
+        .with_destructive_guard_status("Checking for destructive commands...")
+        .with_post_edit_status("Formatting and linting...")
+        .with_stop_status("Scope-aware validation...")
+        .with_path_zone_status("Checking path zones..."),
     })
 }
 

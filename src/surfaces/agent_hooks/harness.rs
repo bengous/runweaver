@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
 
+use serde_json::Value;
+
+use super::command_prefix::RunweaverHookCommandCwd;
 use super::harness_hook_config::{
     HarnessHookConfig, HarnessHookConfigRegistry, HarnessOptions, HarnessTarget, HookBinding,
 };
@@ -7,8 +10,76 @@ use super::runtime::HarnessCodec;
 
 pub type HarnessRegistry<'a> = BTreeMap<String, &'a dyn HarnessCodec>;
 
-/// One agent harness: its protocol codec plus the recipe for rendering its
-/// native hook configuration file. Built-ins: [`claude_harness`](super::claude_harness)
+/// How a manifest's `surfaces.agents` entry binds this harness: where its
+/// hook process runs, which tool names match Bash and edit events, and the
+/// status messages shown for the generic hook slots. [`AgentsSurfaceDefaults::new`]
+/// starts from harness-neutral values; override per harness with the
+/// `with_*` builders.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentsSurfaceDefaults {
+    pub command_cwd: RunweaverHookCommandCwd,
+    pub target_options: HarnessOptions,
+    pub bash_tool_matcher: String,
+    pub edit_tool_matcher: String,
+    pub destructive_guard_status: String,
+    pub post_edit_status: String,
+    pub stop_status: String,
+    pub path_zone_status: String,
+}
+
+impl AgentsSurfaceDefaults {
+    pub fn new(command_cwd: RunweaverHookCommandCwd) -> Self {
+        Self {
+            command_cwd,
+            target_options: HarnessOptions::new(),
+            bash_tool_matcher: "Bash".to_owned(),
+            edit_tool_matcher: "Edit|Write".to_owned(),
+            destructive_guard_status: "Checking destructive commands".to_owned(),
+            post_edit_status: "Formatting and linting edited files".to_owned(),
+            stop_status: "Running validation".to_owned(),
+            path_zone_status: "Checking path zones".to_owned(),
+        }
+    }
+
+    pub fn with_target_option(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.target_options.insert(key.into(), value);
+        self
+    }
+
+    pub fn with_bash_tool_matcher(mut self, matcher: impl Into<String>) -> Self {
+        self.bash_tool_matcher = matcher.into();
+        self
+    }
+
+    pub fn with_edit_tool_matcher(mut self, matcher: impl Into<String>) -> Self {
+        self.edit_tool_matcher = matcher.into();
+        self
+    }
+
+    pub fn with_destructive_guard_status(mut self, status: impl Into<String>) -> Self {
+        self.destructive_guard_status = status.into();
+        self
+    }
+
+    pub fn with_post_edit_status(mut self, status: impl Into<String>) -> Self {
+        self.post_edit_status = status.into();
+        self
+    }
+
+    pub fn with_stop_status(mut self, status: impl Into<String>) -> Self {
+        self.stop_status = status.into();
+        self
+    }
+
+    pub fn with_path_zone_status(mut self, status: impl Into<String>) -> Self {
+        self.path_zone_status = status.into();
+        self
+    }
+}
+
+/// One agent harness: its protocol codec, the recipe for rendering its
+/// native hook configuration file, and the defaults the manifest agents
+/// surface uses to bind it. Built-ins: [`claude_harness`](super::claude_harness)
 /// and [`codex_harness`](super::codex_harness); custom harnesses via
 /// [`define_harness`].
 #[derive(Clone)]
@@ -16,12 +87,14 @@ pub struct Harness<'a> {
     pub id: String,
     pub codec: &'a dyn HarnessCodec,
     pub hook_config: HarnessHookConfig,
+    pub agents_surface: AgentsSurfaceDefaults,
 }
 
 pub struct HarnessDefinition<'a> {
     pub id: String,
     pub codec: &'a dyn HarnessCodec,
     pub hook_config: HarnessHookConfig,
+    pub agents_surface: AgentsSurfaceDefaults,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -98,6 +171,7 @@ pub fn define_harness(definition: HarnessDefinition<'_>) -> Harness<'_> {
         id: definition.id,
         codec: definition.codec,
         hook_config: definition.hook_config,
+        agents_surface: definition.agents_surface,
     }
 }
 
@@ -219,6 +293,7 @@ mod tests {
                 ".fixture/hooks.json",
                 |_input: HarnessHookConfigRenderInput<'_>| Ok("{}".to_owned()),
             ),
+            agents_surface: AgentsSurfaceDefaults::new(RunweaverHookCommandCwd::None),
         })
     }
 

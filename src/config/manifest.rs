@@ -518,14 +518,7 @@ pub fn load_runweaver_manifest(
         .surfaces
         .as_ref()
         .and_then(|surfaces| surfaces.agents.as_ref())
-        .map(|agents| {
-            agents_surface_to_agent_hooks_manifest(
-                agents,
-                manifest.paths.as_ref(),
-                &definition.task_config(),
-                project_binary,
-            )
-        });
+        .map(|agents| agents_surface_to_agent_hooks_manifest(agents, project_binary, registry));
     let agent_hooks = agent_hooks_manifest.as_ref().and_then(|hooks| {
         load_agent_hooks(
             hooks,
@@ -1054,25 +1047,17 @@ fn parse_regex_diagnostics(pattern: &str, text: &str) -> Vec<serde_json::Value> 
 
 fn agents_surface_to_agent_hooks_manifest(
     agents: &AgentsSurfaceManifest,
-    _paths: Option<&PathZonesManifest>,
-    _config: &super::RunweaverConfig,
     project_binary: &RunweaverProjectBinary,
+    registry: &BuiltinRegistry,
 ) -> AgentHooksConfigManifest {
-    let pi_prefix = agent_hook_command_prefix(
-        "pi",
-        crate::surfaces::agent_hooks::RunweaverHookCommandCwd::Env("PI_PROJECT_DIR".to_owned()),
-        &project_binary.out_path,
-    );
-    let codex_prefix = agent_hook_command_prefix(
-        "codex",
-        crate::surfaces::agent_hooks::RunweaverHookCommandCwd::GitRoot,
-        &project_binary.out_path,
-    );
-    let claude_prefix = agent_hook_command_prefix(
-        "claude",
-        crate::surfaces::agent_hooks::RunweaverHookCommandCwd::Env("CLAUDE_PROJECT_DIR".to_owned()),
-        &project_binary.out_path,
-    );
+    // Harnesses missing from the registry get no targets or bindings here;
+    // load_agent_hooks records them as unknown builtins so the manifest load
+    // still fails fast.
+    let harnesses = agents
+        .harnesses
+        .iter()
+        .filter_map(|name| registry.harnesses.get(name))
+        .collect::<Vec<_>>();
     let mut hooks = Vec::new();
 
     for guard in &agents.pre_tool {
@@ -1083,8 +1068,7 @@ fn agents_surface_to_agent_hooks_manifest(
                 "guard-destructive",
                 HookStage::PreTool,
                 "guardDestructive",
-                agents
-                    .harnesses
+                harnesses
                     .iter()
                     .map(|harness| destructive_binding(harness))
                     .collect(),
@@ -1098,8 +1082,7 @@ fn agents_surface_to_agent_hooks_manifest(
             "post-edit-quality",
             HookStage::PostEdit,
             &format!("agentsPostEdit:{}", slot.run),
-            agents
-                .harnesses
+            harnesses
                 .iter()
                 .map(|harness| post_edit_binding(harness, slot.timeout.unwrap_or(90)))
                 .collect(),
@@ -1111,8 +1094,7 @@ fn agents_surface_to_agent_hooks_manifest(
             "stop-validate",
             HookStage::Stop,
             &format!("agentsStop:{}", slot.run),
-            agents
-                .harnesses
+            harnesses
                 .iter()
                 .map(|harness| stop_binding(harness, slot.timeout.unwrap_or(240)))
                 .collect(),
@@ -1124,47 +1106,20 @@ fn agents_surface_to_agent_hooks_manifest(
         binary_name: format!("{} hook", project_binary.binary_name),
         source_path: "runweaver.config.ts".to_owned(),
         harnesses: agents.harnesses.clone(),
-        targets: agents
-            .harnesses
+        targets: harnesses
             .iter()
-            .filter_map(|harness| match harness.as_str() {
-                "pi" => Some(target("pi", ".pi/hooks.jsonc", &pi_prefix, [])),
-                "codex" => Some(target(
-                    "codex",
-                    ".codex/config.toml",
-                    &codex_prefix,
-                    [("features", serde_json::json!({ "hooks": true }))],
-                )),
-                "claude" => Some(target(
-                    "claude",
-                    ".claude/settings.json",
-                    &claude_prefix,
-                    [(
-                        "worktreeSymlinkDirectories",
-                        serde_json::json!(["node_modules"]),
-                    )],
-                )),
-                _ => None,
+            .map(|harness| HarnessTargetManifest {
+                harness: harness.id.clone(),
+                path: harness.hook_config.default_path.clone(),
+                command_prefix: agent_hook_command_prefix(
+                    &harness.id,
+                    harness.agents_surface.command_cwd.clone(),
+                    &project_binary.out_path,
+                ),
+                options: harness.agents_surface.target_options.clone(),
             })
             .collect(),
         hooks,
-    }
-}
-
-fn target(
-    harness: &str,
-    path: &str,
-    command_prefix: &str,
-    options: impl IntoIterator<Item = (&'static str, serde_json::Value)>,
-) -> HarnessTargetManifest {
-    HarnessTargetManifest {
-        harness: harness.to_owned(),
-        path: path.to_owned(),
-        command_prefix: command_prefix.to_owned(),
-        options: options
-            .into_iter()
-            .map(|(key, value)| (key.to_owned(), value))
-            .collect(),
     }
 }
 
@@ -1185,55 +1140,29 @@ fn hook(
     }
 }
 
-fn destructive_binding(harness: &str) -> HookBindingManifest {
-    pre_tool_binding(
-        harness,
+fn destructive_binding(harness: &Harness<'_>) -> HookBindingManifest {
+    binding(
+        &harness.id,
         10,
-        match harness {
-            "claude" => "Checking for destructive commands...",
-            _ => "Checking destructive commands",
-        },
+        &harness.agents_surface.destructive_guard_status,
+        Some(&harness.agents_surface.bash_tool_matcher),
     )
 }
 
-fn pre_tool_binding(harness: &str, timeout: u32, status_message: &str) -> HookBindingManifest {
+fn post_edit_binding(harness: &Harness<'_>, timeout: u32) -> HookBindingManifest {
     binding(
-        harness,
+        &harness.id,
         timeout,
-        status_message,
-        match harness {
-            "codex" => Some("^Bash$"),
-            _ => Some("Bash"),
-        },
+        &harness.agents_surface.post_edit_status,
+        Some(&harness.agents_surface.edit_tool_matcher),
     )
 }
 
-fn post_edit_binding(harness: &str, timeout: u32) -> HookBindingManifest {
+fn stop_binding(harness: &Harness<'_>, timeout: u32) -> HookBindingManifest {
     binding(
-        harness,
+        &harness.id,
         timeout,
-        match harness {
-            "claude" => "Formatting and linting...",
-            _ => "Formatting and linting edited files",
-        },
-        match harness {
-            "codex" => Some("^(apply_patch|Edit|Write|MultiEdit)$"),
-            "claude" => Some("Edit|Write|MultiEdit"),
-            _ => Some("Edit|Write"),
-        },
-    )
-}
-
-fn stop_binding(harness: &str, timeout: u32) -> HookBindingManifest {
-    binding(
-        harness,
-        timeout,
-        match harness {
-            "pi" => "Running Pi validation",
-            "codex" => "Running Codex validation",
-            "claude" => "Scope-aware validation...",
-            _ => "Running validation",
-        },
+        &harness.agents_surface.stop_status,
         None,
     )
 }
@@ -1668,7 +1597,7 @@ fn load_agent_hooks(
             }),
         );
     }
-    if let Some(hook) = derived_path_zone_hook(manifest, paths) {
+    if let Some(hook) = derived_path_zone_hook(manifest, paths, registry) {
         builder.hook(hook.command, hook.bindings);
     }
     Some(builder.build())
@@ -1677,6 +1606,7 @@ fn load_agent_hooks(
 fn derived_path_zone_hook(
     manifest: &AgentHooksConfigManifest,
     paths: Option<&PathZonesManifest>,
+    registry: &BuiltinRegistry,
 ) -> Option<AgentHooksConfigHook> {
     let paths = paths?;
     if paths.generated.is_empty() && paths.read_only.is_empty() {
@@ -1685,7 +1615,7 @@ fn derived_path_zone_hook(
 
     let mut bindings = Vec::new();
     for harness in &manifest.harnesses {
-        if let Some(binding) = derived_path_zone_binding(harness, manifest) {
+        if let Some(binding) = derived_path_zone_binding(harness, manifest, registry) {
             bindings.push(binding);
         }
     }
@@ -1705,28 +1635,21 @@ fn derived_path_zone_hook(
 fn derived_path_zone_binding(
     harness: &str,
     manifest: &AgentHooksConfigManifest,
+    registry: &BuiltinRegistry,
 ) -> Option<HookBinding> {
     let command_prefix = manifest
         .targets
         .iter()
         .find(|target| target.harness == harness)
         .map(|target| target.command_prefix.clone());
-    let (matcher, status_message) = match harness {
-        "pi" => ("Edit|Write", "Checking path zones"),
-        "codex" => (
-            "^(apply_patch|Edit|Write|MultiEdit)$",
-            "Checking path zones",
-        ),
-        "claude" => ("Edit|Write|MultiEdit", "Checking path zones..."),
-        _ => return None,
-    };
+    let defaults = &registry.harnesses.get(harness)?.agents_surface;
 
     Some(HookBinding {
         harness: harness.to_owned(),
-        matcher: Some(matcher.to_owned()),
+        matcher: Some(defaults.edit_tool_matcher.clone()),
         command_prefix,
         timeout: 10,
-        status_message: status_message.to_owned(),
+        status_message: defaults.path_zone_status.clone(),
         options: serde_json::Map::new(),
     })
 }
@@ -1977,7 +1900,7 @@ fn git_hook_script(
         "#!/usr/bin/env sh",
         "set -eu",
         "",
-        "# Pi worktree hook env isolation: let nested git commands rediscover cwd.",
+        "# Worktree hook env isolation: let nested git commands rediscover cwd.",
         "git_local_env=\"$(git rev-parse --local-env-vars 2>/dev/null || true)\"",
         "if [ -n \"$git_local_env\" ]; then",
         "  unset $git_local_env",
@@ -2327,7 +2250,6 @@ mod tests {
                     "harness/",
                     "platform/",
                     ".claude/",
-                    ".pi/",
                     ".agents/",
                     ".codex/",
                 ],
@@ -2342,7 +2264,6 @@ mod tests {
                     "harness/",
                     "platform/",
                     ".claude/",
-                    ".pi/",
                     ".agents/",
                     ".codex/",
                 ]),
@@ -2549,6 +2470,169 @@ mod tests {
             ])),
             HookOutcome::Block { ref reason, .. } if reason.contains("Read-only path zone vendor/reference/")
         ));
+    }
+
+    #[test]
+    fn agents_surface_renders_targets_and_bindings_from_harness_defaults() {
+        struct FixtureCodec;
+
+        impl crate::surfaces::agent_hooks::HarnessCodec for FixtureCodec {
+            fn harness(&self) -> &'static str {
+                "fixture"
+            }
+
+            fn decode(
+                &self,
+                _stdin: &str,
+                stage: HookStage,
+                _env: &crate::surfaces::agent_hooks::HookEnv,
+            ) -> anyhow::Result<crate::surfaces::agent_hooks::HookRequest> {
+                Ok(crate::surfaces::agent_hooks::HookRequest {
+                    event: HookEvent {
+                        harness: "fixture".to_owned(),
+                        stage,
+                        session_id: "session".to_owned(),
+                        tool_call_id: None,
+                        transcript_path: None,
+                        cwd: "/repo".to_owned(),
+                        touched_path_candidates: Vec::new(),
+                        patch_text: None,
+                        tool_command: None,
+                        tool_name: None,
+                        tool_response: None,
+                        stop_hook_active: false,
+                    },
+                })
+            }
+
+            fn encode(
+                &self,
+                _outcome: HookOutcome,
+                _request: &crate::surfaces::agent_hooks::HookRequest,
+            ) -> crate::surfaces::agent_hooks::HookEmission {
+                crate::surfaces::agent_hooks::HookEmission {
+                    exit_code: 0,
+                    stdout: None,
+                    stderr: None,
+                }
+            }
+
+            fn encode_failure(
+                &self,
+                _stage: HookStage,
+                _error: &anyhow::Error,
+            ) -> crate::surfaces::agent_hooks::HookEmission {
+                crate::surfaces::agent_hooks::HookEmission {
+                    exit_code: 1,
+                    stdout: None,
+                    stderr: None,
+                }
+            }
+        }
+
+        static FIXTURE_CODEC: FixtureCodec = FixtureCodec;
+
+        let fixture_harness = crate::surfaces::agent_hooks::define_harness(
+            crate::surfaces::agent_hooks::HarnessDefinition {
+                id: "fixture".to_owned(),
+                codec: &FIXTURE_CODEC,
+                hook_config: crate::surfaces::agent_hooks::HarnessHookConfig::new(
+                    ".fixture/hooks.json",
+                    |_input| Ok("{}\n".to_owned()),
+                ),
+                agents_surface: crate::surfaces::agent_hooks::AgentsSurfaceDefaults::new(
+                    crate::surfaces::agent_hooks::RunweaverHookCommandCwd::Env(
+                        "FIXTURE_PROJECT_DIR".to_owned(),
+                    ),
+                )
+                .with_target_option("emitDiagnostics", serde_json::json!(true))
+                .with_bash_tool_matcher("^Bash$")
+                .with_edit_tool_matcher("^(Edit|Write)$")
+                .with_destructive_guard_status("Fixture destructive check")
+                .with_post_edit_status("Fixture post-edit")
+                .with_stop_status("Fixture stop validation")
+                .with_path_zone_status("Fixture path zones"),
+            },
+        );
+
+        let manifest = RunweaverDefinitionManifest {
+            version: RUNWEAVER_DEFINITION_MANIFEST_VERSION,
+            paths: Some(PathZonesManifest {
+                generated: vec!["settings.managed.json".to_owned()],
+                ..PathZonesManifest::default()
+            }),
+            tools: BTreeMap::new(),
+            pipelines: BTreeMap::new(),
+            operations: BTreeMap::new(),
+            surfaces: Some(SurfacesManifest {
+                agents: Some(AgentsSurfaceManifest {
+                    harnesses: vec!["fixture".to_owned()],
+                    pre_tool: vec![AgentsPreToolGuardManifest::Builtin {
+                        guard: AgentsBuiltinGuardManifest::DestructiveCommands,
+                    }],
+                    post_edit: Some(AgentsPipelineSlotManifest {
+                        run: "autofix".to_owned(),
+                        timeout: None,
+                    }),
+                    stop: Some(AgentsPipelineSlotManifest {
+                        run: "validate".to_owned(),
+                        timeout: None,
+                    }),
+                }),
+                git: None,
+                ci: None,
+                cli: None,
+            }),
+            bindings: Vec::new(),
+        };
+        let registry = BuiltinRegistry::new()
+            .harness("fixture", fixture_harness)
+            .hook_command("guardDestructive", |_event| Ok(HookOutcome::pass()));
+
+        let loaded = load_runweaver_manifest(&manifest, &registry, &test_project_binary())
+            .expect("custom harness defaults should drive the agents surface");
+        let hooks = loaded.agent_hooks.expect("hooks should be present");
+
+        assert_eq!(
+            hooks.targets,
+            vec![
+                HarnessTarget::new(
+                    "fixture",
+                    ".fixture/hooks.json",
+                    "cd \"$FIXTURE_PROJECT_DIR\" && ./.runweaver/bin/demo hook fixture",
+                )
+                .with_option("emitDiagnostics", serde_json::json!(true))
+            ]
+        );
+        let binding = |command: &str| {
+            hooks
+                .hooks
+                .iter()
+                .find(|hook| hook.command.name() == command)
+                .unwrap_or_else(|| panic!("{command} should be configured"))
+                .bindings[0]
+                .clone()
+        };
+        assert_eq!(
+            binding("guard-destructive"),
+            HookBinding::new("fixture", 10, "Fixture destructive check").with_matcher("^Bash$")
+        );
+        assert_eq!(
+            binding("post-edit-quality"),
+            HookBinding::new("fixture", 90, "Fixture post-edit").with_matcher("^(Edit|Write)$")
+        );
+        assert_eq!(
+            binding("stop-validate"),
+            HookBinding::new("fixture", 240, "Fixture stop validation")
+        );
+        assert_eq!(
+            binding("guard-path-zones"),
+            HookBinding::new("fixture", 10, "Fixture path zones")
+                .with_matcher("^(Edit|Write)$")
+                .with_command_prefix(
+                    "cd \"$FIXTURE_PROJECT_DIR\" && ./.runweaver/bin/demo hook fixture",
+                )
+        );
     }
 
     #[test]
@@ -2805,7 +2889,7 @@ mod tests {
                         run: "validate".to_owned(),
                     }),
                     post_commit: Some(GitToolSlotManifest {
-                        tool: "installPiConfig".to_owned(),
+                        tool: "installAgentConfig".to_owned(),
                     }),
                 }),
                 ci: Some(CiSurfaceManifest {

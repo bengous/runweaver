@@ -110,9 +110,9 @@ pub use destructive_commands::{
 };
 pub use failure::hook_failure_reason;
 pub use harness::{
-    Harness, HarnessDefinition, HarnessError, HarnessRegistry, HarnessTargetInput,
-    HookBindingInput, define_harness, harness_hook_config_registry_from_harnesses,
-    harness_registry_from_harnesses,
+    AgentsSurfaceDefaults, Harness, HarnessDefinition, HarnessError, HarnessRegistry,
+    HarnessTargetInput, HookBindingInput, define_harness,
+    harness_hook_config_registry_from_harnesses, harness_registry_from_harnesses,
 };
 pub use harness_hook_config::{
     HarnessHookCommand, HarnessHookConfig, HarnessHookConfigCheckResult, HarnessHookConfigError,

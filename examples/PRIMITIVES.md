@@ -104,7 +104,7 @@ stays pure: four orchestration concepts only.
 - **post-commit install side effect**: `git.postCommit` ruled **keep**
   (2026-06-10, user arbitrage): the slot is a standard git hook stage and a
   production consumer is not speculative — same reasoning as `checkOnly`.
-  The slot is generic; its content (`bun run install:pi`) is repo-specific
+  The slot is generic; its content (an install script) is repo-specific
   script data, like any script entry.
 - **conventional-commit on the agent surface**: dissolves into the git
   surface; Bash exit + stderr already reach the agent (hook 2, batch 1).

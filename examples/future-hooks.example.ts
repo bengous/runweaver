@@ -32,7 +32,7 @@ import { defineRunweaver } from "@bengous/runweaver";
 //
 //   surfaces: {
 //     agents: {
-//       harnesses: ["pi", "codex", "claude"],
+//       harnesses: ["custom", "codex", "claude"],
 //       preTool: [
 //         { guard: "destructive-commands" },
 //         { guard: "secrets", tool: "gitleaks" },
@@ -145,7 +145,7 @@ import { defineRunweaver } from "@bengous/runweaver";
 // session's touched paths, so `{files}` here receives the session file list
 // — the differentiator (session state) consumed by a plain script. Unscoped
 // runs (CI, CLI) pass the full git diff against the default branch.
-// Non-zero exit -> fail(diagnostics from output) -> pi blocks the stop,
+// Non-zero exit -> fail(diagnostics from output) -> the harness blocks the stop,
 // CI annotates.
 //
 // FINDING (ladder works): a declarative alternative was considered and
@@ -221,10 +221,10 @@ import { defineRunweaver } from "@bengous/runweaver";
 // empty-scope skip, this guard) reuse them.
 
 // ── Hook 8: guard-reference-repos ───────────────────────────────────────────
-// Today: 15-line pi-only defineTaskHook block + gate code.
+// Today: 15-line single-harness defineTaskHook block + gate code.
 // Target: NOTHING beyond `paths.readOnly: ["vendor/reference/"]`.
 //
-// FINDING: today's pi-only binding disappears — the target applies the guard
+// FINDING: today's single-harness binding disappears — the target applies the guard
 // uniformly wherever pre-tool blocking exists (open question 3 in
 // target-config: verify nothing relied on the asymmetry before cutover).
 // Subsumed by hook 7's mechanism; not a separate primitive.
@@ -253,7 +253,7 @@ import { defineRunweaver } from "@bengous/runweaver";
 // FINDING: session semantics (touched-path accumulation, git-fingerprint
 // read-only proof, run-only-after-relevant-changes) move wholesale into the
 // agents surface — they are the differentiator, and they are NOT user
-// config. Today's pi-only `runWhen: "after-relevant-changes"` becomes the
+// config. Today's single-harness `runWhen: "after-relevant-changes"` becomes the
 // default everywhere; per-harness capability gaps surface in the sync
 // capability-loss report instead of in user-maintained bindings.
 

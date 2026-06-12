@@ -542,6 +542,9 @@ mod tests {
                     ))
                 },
             ),
+            agents_surface: crate::surfaces::agent_hooks::AgentsSurfaceDefaults::new(
+                crate::surfaces::agent_hooks::RunweaverHookCommandCwd::None,
+            ),
         })
     }
 
