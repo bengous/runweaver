@@ -1,0 +1,21 @@
+[package]
+name = "runweaver"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Declare a project's quality tooling once for agent hooks, Git hooks, CI, and CLIs with under 5 ms orchestrator overhead."
+repository = "https://github.com/bengous/runweaver"
+readme = "README.md"
+rust-version = "1.85"
+keywords = ["automation", "hooks", "ci", "quality", "agents"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0"
+regex = "1.11"
+schemars = { version = "0.8", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+time = { version = "0.3", features = ["formatting"] }
