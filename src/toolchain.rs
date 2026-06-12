@@ -351,27 +351,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn install_managed_toolchain_runs_package_manager_inside_toolchain_root() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = test_root("install");
         let toolchain_root = managed_toolchain_root(&root);
         std::fs::create_dir_all(&toolchain_root).unwrap();
         std::fs::write(toolchain_root.join("package.json"), "{\"private\":true}\n").unwrap();
-        let fake_bun = root.join("fake-bun");
+        // Run the fake package manager as `sh install` instead of exec-ing a
+        // freshly written executable: exec-ing it races with concurrent
+        // fork/exec in parallel tests (ETXTBSY). `spawn_install` passes
+        // `install` as the argument and the toolchain root as cwd, so `sh`
+        // reads this script.
         std::fs::write(
-            &fake_bun,
-            r#"#!/usr/bin/env sh
-printf "%s" "$PWD" > ran-cwd.txt
+            toolchain_root.join("install"),
+            r#"printf "%s" "$PWD" > ran-cwd.txt
 mkdir -p node_modules/.bin
 touch bun.lock
 "#,
         )
         .unwrap();
-        let mut permissions = std::fs::metadata(&fake_bun).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&fake_bun, permissions).unwrap();
 
-        let result = install_managed_toolchain(&root, Some(&path_to_string(&fake_bun))).unwrap();
+        let result = install_managed_toolchain(&root, Some("sh")).unwrap();
 
         assert_eq!(result.exit_code, 0);
         assert!(toolchain_root.join("bun.lock").exists());
