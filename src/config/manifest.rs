@@ -1022,7 +1022,10 @@ fn spawn_manifest_tool(
 fn resolve_manifest_executable(program: &str, ctx: &super::ExecutionContext) -> PathBuf {
     match crate::toolchain::resolve_managed_binary(Path::new(&ctx.cwd), program) {
         crate::toolchain::ResolveManagedBinaryResult::Found { path } => path,
-        crate::toolchain::ResolveManagedBinaryResult::Missing { .. } => PathBuf::from(program),
+        crate::toolchain::ResolveManagedBinaryResult::Missing { .. } => {
+            crate::toolchain::resolve_repo_local_binary(Path::new(&ctx.cwd), program)
+                .unwrap_or_else(|| PathBuf::from(program))
+        }
     }
 }
 

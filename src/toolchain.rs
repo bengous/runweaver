@@ -6,10 +6,10 @@
 //!
 //! [`scaffold_runweaver_project`] creates the directory structure
 //! idempotently; [`install_managed_toolchain`] runs the package manager
-//! install inside it; [`resolve_managed_binary`] locates a tool binary
-//! (searching `.runweaver/node_modules/.bin` then the `.runweaver/` root, with
-//! platform-specific names) and reports a diagnostic when it is missing;
-//! [`managed_tool_path_env`] builds the `PATH` value command tasks run with.
+//! install inside it; [`resolve_managed_binary`] locates a managed tool binary;
+//! [`resolve_repo_local_binary`] locates host repo `node_modules/.bin` tools
+//! before command execution falls back to `PATH`; [`managed_tool_path_env`]
+//! builds the `PATH` value command tasks run with.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -119,6 +119,27 @@ pub fn resolve_managed_binary(cwd: impl AsRef<Path>, program: &str) -> ResolveMa
         )
         .with_path(format!(".runweaver/node_modules/.bin/{program}")),
     }
+}
+
+/// Resolves `program` from the nearest `node_modules/.bin` directory,
+/// walking up from `cwd` to the filesystem root. Used after the managed
+/// `.runweaver/` lookup and before falling back to `PATH`.
+pub fn resolve_repo_local_binary(cwd: impl AsRef<Path>, program: &str) -> Option<PathBuf> {
+    if program.contains('/') || program.contains('\\') {
+        return None;
+    }
+
+    let names = binary_names(program);
+    for ancestor in cwd.as_ref().ancestors() {
+        for name in &names {
+            let candidate = ancestor.join("node_modules").join(".bin").join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
 }
 
 pub fn managed_tool_path_env(cwd: impl AsRef<Path>, parent_path: Option<&str>) -> String {
@@ -301,6 +322,55 @@ mod tests {
         let result = resolve_managed_binary(&root, "tool");
 
         assert!(matches!(result, ResolveManagedBinaryResult::Found { .. }));
+    }
+
+    #[test]
+    fn resolve_repo_local_binary_finds_bin_in_cwd_node_modules() {
+        let root = test_root("repo-local-found");
+        let bin_dir = root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let tool = bin_dir.join("tool");
+        std::fs::write(&tool, "").unwrap();
+
+        let result = resolve_repo_local_binary(&root, "tool");
+
+        assert_eq!(result, Some(tool));
+    }
+
+    #[test]
+    fn resolve_repo_local_binary_walks_up_to_ancestor_node_modules() {
+        let root = test_root("repo-local-ancestor");
+        let bin_dir = root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let tool = bin_dir.join("tool");
+        std::fs::write(&tool, "").unwrap();
+        let app = root.join("packages").join("app");
+        std::fs::create_dir_all(&app).unwrap();
+
+        let result = resolve_repo_local_binary(&app, "tool");
+
+        assert_eq!(result, Some(tool));
+    }
+
+    #[test]
+    fn resolve_repo_local_binary_returns_none_when_absent() {
+        let root = test_root("repo-local-absent");
+
+        let result = resolve_repo_local_binary(&root, "tool");
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn resolve_repo_local_binary_ignores_path_shaped_programs() {
+        let root = test_root("repo-local-path-shaped");
+        let bin_dir = root.join("node_modules").join(".bin").join("dir");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("tool"), "").unwrap();
+
+        let result = resolve_repo_local_binary(&root, "dir/tool");
+
+        assert_eq!(result, None);
     }
 
     #[test]

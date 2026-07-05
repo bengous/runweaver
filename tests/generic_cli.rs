@@ -212,6 +212,54 @@ fn generic_cli_executes_git_hook_slots_from_the_manifest() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn generic_cli_git_hook_resolves_tools_from_repo_local_node_modules_bin() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let manifest = serde_json::json!({
+        "version": 2,
+        "paths": { "writable": ["src/"] },
+        "tools": {
+            "hosttool": {
+                "check": ["hosttool"],
+                "diagnostics": { "parser": "unix" },
+                "targets": { "fallback": ["src/"] }
+            }
+        },
+        "pipelines": {
+            "check": { "check": ["hosttool"] }
+        },
+        "operations": {},
+        "surfaces": {
+            "git": {
+                "preCommit": { "run": "check" }
+            },
+            "cli": true
+        },
+        "bindings": []
+    });
+    let root = temp_project("git-hook-repo-local-bin", &manifest);
+    let bin_dir = root.join("node_modules").join(".bin");
+    std::fs::create_dir_all(&bin_dir).expect("repo-local bin dir should be created");
+    let hosttool = bin_dir.join("hosttool");
+    std::fs::write(&hosttool, "#!/bin/sh\nexit 0\n").expect("hosttool should be written");
+    let mut permissions = std::fs::metadata(&hosttool)
+        .expect("hosttool metadata should be readable")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&hosttool, permissions).expect("hosttool should be executable");
+
+    let run = run_cli(&root, &["git-hook", "pre-commit"], "");
+    std::fs::remove_dir_all(&root).expect("temp project root should be removed");
+
+    assert_eq!(
+        run.exit_code, 0,
+        "git-hook pre-commit should resolve repo-local hosttool: stdout={} stderr={}",
+        run.stdout, run.stderr
+    );
+}
+
 #[test]
 fn generic_cli_requires_a_project_binary_for_unknown_builtins() {
     let mut manifest = generic_manifest();
