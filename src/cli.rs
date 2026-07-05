@@ -2685,6 +2685,20 @@ mod tests {
     }
 
     #[test]
+    fn manifest_types_banner_points_consumers_at_the_cli_command() {
+        // The banner ships into consuming repos via `runweaver manifest types`;
+        // it must reference that command, not this repo's dev script.
+        assert!(
+            MANIFEST_TYPES_DTS.contains("// Regenerate with: runweaver manifest types"),
+            "banner should name the CLI regeneration command"
+        );
+        assert!(
+            !MANIFEST_TYPES_DTS.contains("generate-manifest-types.sh"),
+            "banner should not reference a script that consuming repos do not have"
+        );
+    }
+
+    #[test]
     fn embedded_manifest_types_are_generated_from_current_schema() {
         let stamped = MANIFEST_TYPES_DTS
             .lines()

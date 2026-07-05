@@ -1,5 +1,5 @@
 // Generated from the Runweaver manifest JSON schema. Do not edit.
-// Regenerate with scripts/generate-manifest-types.sh
+// Regenerate with: runweaver manifest types
 // schema-sha256: bdf7933bce9dac2ed213abcb797cbbf76ffee79c3e6f56f064cca25b052bff95
 
 export type RunweaverOperationDefinitionManifest = {

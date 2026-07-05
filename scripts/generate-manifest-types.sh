@@ -13,7 +13,7 @@ schema="$tmp/.runweaver/manifest.schema.json"
 hash="$(sha256sum "$schema" | cut -d' ' -f1)"
 
 banner="// Generated from the Runweaver manifest JSON schema. Do not edit.
-// Regenerate with scripts/generate-manifest-types.sh
+// Regenerate with: runweaver manifest types
 // schema-sha256: $hash"
 
 bunx json-schema-to-typescript -i "$schema" -o assets/manifest.d.ts --bannerComment "$banner"
