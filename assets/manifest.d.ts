@@ -1,6 +1,6 @@
 // Generated from the Runweaver manifest JSON schema. Do not edit.
 // Regenerate with: runweaver manifest types
-// schema-sha256: bdf7933bce9dac2ed213abcb797cbbf76ffee79c3e6f56f064cca25b052bff95
+// schema-sha256: 07faf47d550c2df67dd780522fcf50e1c49c7c7a58245d1c463bfb9993ed6b38
 
 export type RunweaverOperationDefinitionManifest = {
   builtin: string;

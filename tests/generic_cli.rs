@@ -144,6 +144,35 @@ fn write_project_file(root: &Path, path: &str, content: &str) {
     std::fs::write(path, content).expect("project file should be written");
 }
 
+fn append_claude_user_hook(root: &Path) {
+    let path = root.join(".claude/settings.json");
+    let mut settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&path).expect(".claude/settings.json should be readable"),
+    )
+    .expect(".claude/settings.json should parse");
+    settings["hooks"]
+        .as_object_mut()
+        .expect("hooks should be an object")
+        .entry("PostToolUse".to_owned())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .expect("PostToolUse should be an array")
+        .push(serde_json::json!({
+            "matcher": "Edit",
+            "hooks": [{
+                "type": "command",
+                "command": "./scripts/my-hook.sh",
+                "timeout": 3,
+                "statusMessage": "Mine"
+            }]
+        }));
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&settings).expect("settings should serialize") + "\n",
+    )
+    .expect(".claude/settings.json should be written");
+}
+
 #[cfg(unix)]
 fn read_recorder_args(root: &Path) -> String {
     std::fs::read_to_string(root.join("recorder-args.txt"))
@@ -295,6 +324,117 @@ fn generic_cli_syncs_native_hook_configs_and_git_hooks() {
     assert!(
         pre_commit.contains("exec runweaver git-hook pre-commit"),
         "git pre-commit should fall back to the generic binary on PATH: {pre_commit}"
+    );
+}
+
+#[test]
+fn generic_cli_sync_hooks_preserves_hand_authored_agent_hooks() {
+    let root = temp_project("sync-preserve-hooks", &generic_manifest());
+    write_project_file(
+        &root,
+        ".claude/settings.json",
+        r#"{
+  "permissions": {
+    "allow": ["Bash(git status)"]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/my-hook.sh",
+            "timeout": 3,
+            "statusMessage": "Mine"
+          }
+        ]
+      }
+    ]
+  }
+}
+"#,
+    );
+    write_project_file(
+        &root,
+        ".codex/config.toml",
+        r#"# hand-authored comment
+model = "gpt-5.5"
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = './scripts/codex-user-hook.sh'
+timeout = 3
+statusMessage = "Mine"
+"#,
+    );
+
+    let sync = run_cli(&root, &["sync", "hooks"], "");
+    let check = run_cli(&root, &["check", "hooks"], "");
+    let claude = std::fs::read_to_string(root.join(".claude/settings.json"))
+        .expect(".claude/settings.json should be readable");
+    let codex = std::fs::read_to_string(root.join(".codex/config.toml"))
+        .expect(".codex/config.toml should be readable");
+    std::fs::remove_dir_all(&root).expect("temp project root should be removed");
+
+    assert_eq!(
+        sync.exit_code, 0,
+        "sync hooks should succeed: stdout={} stderr={}",
+        sync.stdout, sync.stderr
+    );
+    assert!(
+        claude.contains("\"permissions\""),
+        "permissions lost: {claude}"
+    );
+    assert!(
+        claude.contains("./scripts/my-hook.sh"),
+        "claude user hook lost: {claude}"
+    );
+    assert!(
+        claude.contains("runweaver hook claude guard-destructive"),
+        "claude runweaver hook missing: {claude}"
+    );
+    assert!(
+        codex.contains("# hand-authored comment"),
+        "codex comment lost: {codex}"
+    );
+    assert!(codex.contains("model = \"gpt-5.5\""), "model lost: {codex}");
+    assert!(
+        codex.contains("./scripts/codex-user-hook.sh"),
+        "codex user hook lost: {codex}"
+    );
+    assert!(
+        codex.contains("runweaver hook codex guard-destructive"),
+        "codex runweaver hook missing: {codex}"
+    );
+    assert_eq!(
+        check.exit_code, 0,
+        "check hooks should ignore foreign content: stdout={} stderr={}",
+        check.stdout, check.stderr
+    );
+}
+
+#[test]
+fn generic_cli_check_hooks_ignores_foreign_agent_config_content() {
+    let root = temp_project("check-ignore-foreign-hooks", &generic_manifest());
+
+    let sync = run_cli(&root, &["sync", "hooks"], "");
+    append_claude_user_hook(&root);
+    let check = run_cli(&root, &["check", "hooks"], "");
+    std::fs::remove_dir_all(&root).expect("temp project root should be removed");
+
+    assert_eq!(
+        sync.exit_code, 0,
+        "sync hooks should succeed: stdout={} stderr={}",
+        sync.stdout, sync.stderr
+    );
+    assert_eq!(
+        check.exit_code, 0,
+        "check hooks should ignore foreign content: stdout={} stderr={}",
+        check.stdout, check.stderr
     );
 }
 

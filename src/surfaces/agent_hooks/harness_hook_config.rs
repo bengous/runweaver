@@ -2,6 +2,7 @@ use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
 use super::contract::HookStage;
 
@@ -144,6 +145,29 @@ pub struct HarnessHookConfigRenderInput<'a> {
     pub groups: &'a [HarnessHookGroup],
 }
 
+pub struct HarnessHookConfigWriteInput<'a> {
+    pub path: &'a Path,
+    pub source_path: &'a str,
+    pub target: &'a HarnessTarget,
+    pub groups: &'a [HarnessHookGroup],
+    pub owned_command_prefixes: &'a [String],
+    pub existing_content: Option<&'a str>,
+}
+
+pub struct HarnessHookConfigCheckInput<'a> {
+    pub path: &'a Path,
+    pub source_path: &'a str,
+    pub target: &'a HarnessTarget,
+    pub groups: &'a [HarnessHookGroup],
+    pub owned_command_prefixes: &'a [String],
+    pub actual_content: &'a str,
+}
+
+pub struct HarnessHookConfigCheckProjection {
+    pub expected: String,
+    pub actual: String,
+}
+
 pub struct HookBindingValidationInput<'a> {
     pub hook: &'a HookConfigCommand,
     pub binding: &'a HookBinding,
@@ -151,6 +175,20 @@ pub struct HookBindingValidationInput<'a> {
 
 pub type HarnessHookConfigRenderFn = Arc<
     dyn for<'a> Fn(HarnessHookConfigRenderInput<'a>) -> Result<String, HarnessHookConfigError>
+        + Send
+        + Sync
+        + 'static,
+>;
+pub type HarnessHookConfigWriteFn = Arc<
+    dyn for<'a> Fn(HarnessHookConfigWriteInput<'a>) -> Result<String, HarnessHookConfigError>
+        + Send
+        + Sync
+        + 'static,
+>;
+pub type HarnessHookConfigCheckFn = Arc<
+    dyn for<'a> Fn(
+            HarnessHookConfigCheckInput<'a>,
+        ) -> Result<HarnessHookConfigCheckProjection, HarnessHookConfigError>
         + Send
         + Sync
         + 'static,
@@ -168,6 +206,8 @@ pub type HookBindingValidationFn = Arc<
 pub struct HarnessHookConfig {
     pub default_path: String,
     render: HarnessHookConfigRenderFn,
+    write: Option<HarnessHookConfigWriteFn>,
+    check: Option<HarnessHookConfigCheckFn>,
     validate_target: Option<HarnessTargetValidationFn>,
     validate_binding: Option<HookBindingValidationFn>,
 }
@@ -185,9 +225,38 @@ impl HarnessHookConfig {
         Self {
             default_path: default_path.into(),
             render: Arc::new(render),
+            write: None,
+            check: None,
             validate_target: None,
             validate_binding: None,
         }
+    }
+
+    pub fn with_write(
+        mut self,
+        write: impl for<'a> Fn(
+            HarnessHookConfigWriteInput<'a>,
+        ) -> Result<String, HarnessHookConfigError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.write = Some(Arc::new(write));
+        self
+    }
+
+    pub fn with_check(
+        mut self,
+        check: impl for<'a> Fn(
+            HarnessHookConfigCheckInput<'a>,
+        )
+            -> Result<HarnessHookConfigCheckProjection, HarnessHookConfigError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.check = Some(Arc::new(check));
+        self
     }
 
     pub fn with_validate_target(
@@ -214,6 +283,37 @@ impl HarnessHookConfig {
         input: HarnessHookConfigRenderInput<'_>,
     ) -> Result<String, HarnessHookConfigError> {
         (self.render)(input)
+    }
+
+    pub fn write_content(
+        &self,
+        input: HarnessHookConfigWriteInput<'_>,
+    ) -> Result<String, HarnessHookConfigError> {
+        match &self.write {
+            Some(write) => write(input),
+            None => self.render(HarnessHookConfigRenderInput {
+                source_path: input.source_path,
+                target: input.target,
+                groups: input.groups,
+            }),
+        }
+    }
+
+    pub fn check_projection(
+        &self,
+        input: HarnessHookConfigCheckInput<'_>,
+    ) -> Result<HarnessHookConfigCheckProjection, HarnessHookConfigError> {
+        match &self.check {
+            Some(check) => check(input),
+            None => Ok(HarnessHookConfigCheckProjection {
+                expected: self.render(HarnessHookConfigRenderInput {
+                    source_path: input.source_path,
+                    target: input.target,
+                    groups: input.groups,
+                })?,
+                actual: input.actual_content.to_owned(),
+            }),
+        }
     }
 
     pub fn validate_target(&self, target: &HarnessTarget) -> Result<(), HarnessHookConfigError> {
@@ -271,6 +371,20 @@ pub enum HarnessHookConfigError {
         #[source]
         source: std::io::Error,
     },
+    #[error("Invalid JSON for {path}: {source}")]
+    InvalidJson {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("Invalid TOML for {path}: {source}")]
+    InvalidToml {
+        path: PathBuf,
+        #[source]
+        source: toml_edit::TomlError,
+    },
+    #[error("Invalid hook config shape for {path}: {message}")]
+    InvalidShape { path: PathBuf, message: String },
 }
 
 pub fn define_harness_hook_config(config: HarnessHookConfig) -> HarnessHookConfig {
@@ -297,19 +411,40 @@ pub fn check_harness_hook_config_files(
     root: &Path,
     config: &HarnessHookConfigSet,
 ) -> Result<HarnessHookConfigCheckResult, HarnessHookConfigError> {
+    validate_harness_hook_config_set(config)?;
     let mut mismatches = Vec::new();
-    for file in render_harness_hook_config_files(config)? {
-        let file_path = root.join(&file.path);
-        let actual = if file_path.exists() {
-            Some(read_to_string(&file_path)?)
-        } else {
-            None
-        };
-        if actual.as_deref() != Some(file.content.as_str()) {
+    for target in &config.targets {
+        let hook_config = hook_config_for_target(config, target)?;
+        let groups = harness_hook_groups(config, target);
+        let owned_command_prefixes = owned_command_prefixes(config, target);
+        let file_path = root.join(&target.path);
+        let actual = read_optional_to_string(&file_path)?;
+        let Some(actual_content) = actual.as_deref() else {
             mismatches.push(HarnessHookConfigMismatch {
-                path: file.path,
-                expected: file.content,
-                actual,
+                path: target.path.clone(),
+                expected: hook_config.render(HarnessHookConfigRenderInput {
+                    source_path: &config.source_path,
+                    target,
+                    groups: &groups,
+                })?,
+                actual: None,
+            });
+            continue;
+        };
+
+        let projection = hook_config.check_projection(HarnessHookConfigCheckInput {
+            path: &file_path,
+            source_path: &config.source_path,
+            target,
+            groups: &groups,
+            owned_command_prefixes: &owned_command_prefixes,
+            actual_content,
+        })?;
+        if projection.actual != projection.expected {
+            mismatches.push(HarnessHookConfigMismatch {
+                path: target.path.clone(),
+                expected: projection.expected,
+                actual: Some(projection.actual),
             });
         }
     }
@@ -323,7 +458,28 @@ pub fn write_harness_hook_config_files(
     root: &Path,
     config: &HarnessHookConfigSet,
 ) -> Result<Vec<HarnessHookFile>, HarnessHookConfigError> {
-    let files = render_harness_hook_config_files(config)?;
+    validate_harness_hook_config_set(config)?;
+    let mut files = Vec::new();
+    for target in &config.targets {
+        let hook_config = hook_config_for_target(config, target)?;
+        let groups = harness_hook_groups(config, target);
+        let owned_command_prefixes = owned_command_prefixes(config, target);
+        let file_path = root.join(&target.path);
+        let existing_content = read_optional_to_string(&file_path)?;
+        let content = hook_config.write_content(HarnessHookConfigWriteInput {
+            path: &file_path,
+            source_path: &config.source_path,
+            target,
+            groups: &groups,
+            owned_command_prefixes: &owned_command_prefixes,
+            existing_content: existing_content.as_deref(),
+        })?;
+        files.push(HarnessHookFile {
+            path: target.path.clone(),
+            content,
+        });
+    }
+
     for file in &files {
         let file_path = root.join(&file.path);
         if let Some(parent) = file_path.parent() {
@@ -407,6 +563,8 @@ pub fn codex_harness_hook_config() -> HarnessHookConfig {
         ".codex/config.toml",
         render_codex_toml,
     ))
+    .with_write(write_codex_toml)
+    .with_check(check_codex_toml)
 }
 
 pub fn claude_harness_hook_config() -> HarnessHookConfig {
@@ -414,6 +572,8 @@ pub fn claude_harness_hook_config() -> HarnessHookConfig {
         ".claude/settings.json",
         render_claude_json,
     ))
+    .with_write(write_claude_json)
+    .with_check(check_claude_json)
 }
 
 pub fn hook_groups_by_stage(groups: &[HarnessHookGroup]) -> Value {
@@ -447,16 +607,23 @@ fn render_harness_hook_config_file(
     config: &HarnessHookConfigSet,
     target: &HarnessTarget,
 ) -> Result<String, HarnessHookConfigError> {
-    let hook_config = config.hook_configs.get(&target.harness).ok_or_else(|| {
-        HarnessHookConfigError::MissingHarnessConfig {
-            harness: target.harness.clone(),
-        }
-    })?;
+    let hook_config = hook_config_for_target(config, target)?;
     let groups = harness_hook_groups(config, target);
     hook_config.render(HarnessHookConfigRenderInput {
         source_path: &config.source_path,
         target,
         groups: &groups,
+    })
+}
+
+fn hook_config_for_target<'a>(
+    config: &'a HarnessHookConfigSet,
+    target: &HarnessTarget,
+) -> Result<&'a HarnessHookConfig, HarnessHookConfigError> {
+    config.hook_configs.get(&target.harness).ok_or_else(|| {
+        HarnessHookConfigError::MissingHarnessConfig {
+            harness: target.harness.clone(),
+        }
     })
 }
 
@@ -509,6 +676,29 @@ fn harness_hook_groups(
     groups
 }
 
+fn owned_command_prefixes(config: &HarnessHookConfigSet, target: &HarnessTarget) -> Vec<String> {
+    let mut prefixes = BTreeMap::from([(target.command_prefix.clone(), ())]);
+    for hook in &config.hooks {
+        for binding in &hook.bindings {
+            if binding.harness == target.harness {
+                if let Some(prefix) = &binding.command_prefix {
+                    prefixes.insert(prefix.clone(), ());
+                }
+            }
+        }
+    }
+    prefixes.into_keys().collect()
+}
+
+/// Runweaver-owned hook commands start with an active command prefix followed by a space or end.
+fn is_owned_hook_command(command: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|prefix| {
+        command
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(' '))
+    })
+}
+
 fn harness_hook_stage_name(stage: HookStage) -> &'static str {
     match stage {
         HookStage::PreTool => "PreToolUse",
@@ -531,85 +721,7 @@ fn render_codex_toml(
 fn render_claude_json(
     input: HarnessHookConfigRenderInput<'_>,
 ) -> Result<String, HarnessHookConfigError> {
-    let mut lines = vec!["{".to_owned(), "  \"hooks\": {".to_owned()];
-    let stages = ordered_groups_by_stage(input.groups);
-    for (stage_index, (stage, groups)) in stages.iter().enumerate() {
-        lines.push(format!("    {}: [", json_string(stage)?));
-        for (group_index, group) in groups.iter().enumerate() {
-            lines.push("      {".to_owned());
-            if let Some(matcher) = &group.matcher {
-                lines.push(format!("        \"matcher\": {},", json_string(matcher)?));
-            }
-            lines.push("        \"hooks\": [".to_owned());
-            for (hook_index, hook) in group.hooks.iter().enumerate() {
-                lines.push("          {".to_owned());
-                lines.push(format!(
-                    "            \"type\": {},",
-                    json_string(&hook.command_type)?
-                ));
-                lines.push(format!(
-                    "            \"command\": {},",
-                    json_string(&hook.command)?
-                ));
-                lines.push(format!("            \"timeout\": {},", hook.timeout));
-                lines.push(format!(
-                    "            \"statusMessage\": {}",
-                    json_string(&hook.status_message)?
-                ));
-                lines.push(format!(
-                    "          }}{}",
-                    if hook_index + 1 == group.hooks.len() {
-                        ""
-                    } else {
-                        ","
-                    }
-                ));
-            }
-            lines.push("        ]".to_owned());
-            lines.push(format!(
-                "      }}{}",
-                if group_index + 1 == groups.len() {
-                    ""
-                } else {
-                    ","
-                }
-            ));
-        }
-        lines.push(format!(
-            "    ]{}",
-            if stage_index + 1 == stages.len() {
-                ""
-            } else {
-                ","
-            }
-        ));
-    }
-    let worktree_directories = match input.target.options.get("worktreeSymlinkDirectories") {
-        Some(Value::Array(directories)) => Some(directories),
-        _ => None,
-    };
-    lines.push(if worktree_directories.is_some() {
-        "  },".to_owned()
-    } else {
-        "  }".to_owned()
-    });
-
-    if let Some(directories) = worktree_directories {
-        lines.push("  \"worktree\": {".to_owned());
-        let rendered_directories = directories
-            .iter()
-            .filter_map(|directory| directory.as_str())
-            .map(json_string)
-            .collect::<Result<Vec<_>, _>>()?
-            .join(", ");
-        lines.push(format!(
-            "    \"symlinkDirectories\": [{rendered_directories}]"
-        ));
-        lines.push("  }".to_owned());
-    }
-
-    lines.push("}".to_owned());
-    Ok(format!("{}\n", lines.join("\n")))
+    json_to_pretty_string(&expected_claude_json_subset(input.target, input.groups))
 }
 
 fn renderable_harness_hook_command(hook: &HarnessHookCommand) -> Value {
@@ -618,23 +730,6 @@ fn renderable_harness_hook_command(hook: &HarnessHookCommand) -> Value {
         "command": hook.command,
         "timeout": hook.timeout,
         "statusMessage": hook.status_message,
-    })
-}
-
-fn ordered_groups_by_stage(groups: &[HarnessHookGroup]) -> Vec<(String, Vec<&HarnessHookGroup>)> {
-    let mut ordered = Vec::<(String, Vec<&HarnessHookGroup>)>::new();
-    for group in groups {
-        match ordered.iter_mut().find(|(stage, _)| stage == &group.stage) {
-            Some((_, groups)) => groups.push(group),
-            None => ordered.push((group.stage.clone(), vec![group])),
-        }
-    }
-    ordered
-}
-
-fn json_string(value: &str) -> Result<String, HarnessHookConfigError> {
-    serde_json::to_string(value).map_err(|error| HarnessHookConfigError::Custom {
-        message: format!("Failed to render JSON string: {error}"),
     })
 }
 
@@ -684,11 +779,551 @@ fn toml_literal_or_basic_string(value: &str) -> String {
     }
 }
 
-fn read_to_string(path: &Path) -> Result<String, HarnessHookConfigError> {
-    std::fs::read_to_string(path).map_err(|source| HarnessHookConfigError::Io {
+fn write_claude_json(
+    input: HarnessHookConfigWriteInput<'_>,
+) -> Result<String, HarnessHookConfigError> {
+    let mut document = match input.existing_content {
+        Some(content) if !content.trim().is_empty() => parse_json_file(input.path, content)?,
+        _ => Value::Object(Map::new()),
+    };
+    let root = json_object_mut(input.path, &mut document, "top-level settings")?;
+    remove_owned_claude_hooks(input.path, root, input.owned_command_prefixes)?;
+    append_generated_claude_hooks(input.path, root, input.groups)?;
+    merge_claude_worktree(input.path, root, input.target)?;
+    json_to_pretty_string(&document)
+}
+
+fn check_claude_json(
+    input: HarnessHookConfigCheckInput<'_>,
+) -> Result<HarnessHookConfigCheckProjection, HarnessHookConfigError> {
+    let actual_document = parse_json_file(input.path, input.actual_content)?;
+    let expected = expected_claude_json_subset(input.target, input.groups);
+    let actual = actual_claude_json_subset(
+        input.path,
+        &actual_document,
+        input.owned_command_prefixes,
+        input.target,
+    )?;
+    Ok(HarnessHookConfigCheckProjection {
+        expected: json_to_pretty_string(&expected)?,
+        actual: json_to_pretty_string(&actual)?,
+    })
+}
+
+fn expected_claude_json_subset(target: &HarnessTarget, groups: &[HarnessHookGroup]) -> Value {
+    let mut root = Map::new();
+    root.insert("hooks".to_owned(), hook_groups_by_stage(groups));
+    if let Some(Value::Array(directories)) = target.options.get("worktreeSymlinkDirectories") {
+        let mut worktree = Map::new();
+        worktree.insert(
+            "symlinkDirectories".to_owned(),
+            Value::Array(directories.clone()),
+        );
+        root.insert("worktree".to_owned(), Value::Object(worktree));
+    }
+    Value::Object(root)
+}
+
+fn actual_claude_json_subset(
+    path: &Path,
+    document: &Value,
+    prefixes: &[String],
+    target: &HarnessTarget,
+) -> Result<Value, HarnessHookConfigError> {
+    let root = json_object(path, document, "top-level settings")?;
+    let mut subset = Map::new();
+    if let Some(hooks) = root.get("hooks") {
+        let hook_subset = owned_claude_hooks_subset(path, hooks, prefixes)?;
+        if !hook_subset.is_empty() {
+            subset.insert("hooks".to_owned(), Value::Object(hook_subset));
+        }
+    }
+    if target.options.contains_key("worktreeSymlinkDirectories") {
+        if let Some(symlink_directories) = root
+            .get("worktree")
+            .and_then(Value::as_object)
+            .and_then(|worktree| worktree.get("symlinkDirectories"))
+        {
+            let mut worktree = Map::new();
+            worktree.insert("symlinkDirectories".to_owned(), symlink_directories.clone());
+            subset.insert("worktree".to_owned(), Value::Object(worktree));
+        }
+    }
+    Ok(Value::Object(subset))
+}
+
+fn remove_owned_claude_hooks(
+    path: &Path,
+    root: &mut Map<String, Value>,
+    prefixes: &[String],
+) -> Result<(), HarnessHookConfigError> {
+    let Some(hooks) = root.get_mut("hooks") else {
+        return Ok(());
+    };
+    let hooks = json_object_mut(path, hooks, "hooks")?;
+    let mut empty_stages = Vec::new();
+    for (stage, groups) in hooks.iter_mut() {
+        let groups = json_array_mut(path, groups, "hook stage")?;
+        groups.retain_mut(|group| {
+            let Some(group) = group.as_object_mut() else {
+                return true;
+            };
+            let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                return true;
+            };
+            hooks.retain(|hook| {
+                hook.get("command")
+                    .and_then(Value::as_str)
+                    .is_none_or(|command| !is_owned_hook_command(command, prefixes))
+            });
+            !hooks.is_empty()
+        });
+        if groups.is_empty() {
+            empty_stages.push(stage.clone());
+        }
+    }
+    for stage in empty_stages {
+        hooks.remove(&stage);
+    }
+    Ok(())
+}
+
+fn append_generated_claude_hooks(
+    path: &Path,
+    root: &mut Map<String, Value>,
+    groups: &[HarnessHookGroup],
+) -> Result<(), HarnessHookConfigError> {
+    let generated = hook_groups_by_stage(groups);
+    let generated = generated
+        .as_object()
+        .ok_or_else(|| HarnessHookConfigError::InvalidShape {
+            path: path.to_path_buf(),
+            message: "generated hooks must be an object".to_owned(),
+        })?;
+    let hooks = root
+        .entry("hooks".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let hooks = json_object_mut(path, hooks, "hooks")?;
+    for (stage, generated_groups) in generated {
+        let stage_groups = hooks
+            .entry(stage.clone())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let stage_groups = json_array_mut(path, stage_groups, "hook stage")?;
+        let generated_groups =
+            generated_groups
+                .as_array()
+                .ok_or_else(|| HarnessHookConfigError::InvalidShape {
+                    path: path.to_path_buf(),
+                    message: format!("generated hook stage {stage} must be an array"),
+                })?;
+        stage_groups.extend(generated_groups.iter().cloned());
+    }
+    Ok(())
+}
+
+fn merge_claude_worktree(
+    path: &Path,
+    root: &mut Map<String, Value>,
+    target: &HarnessTarget,
+) -> Result<(), HarnessHookConfigError> {
+    let Some(Value::Array(directories)) = target.options.get("worktreeSymlinkDirectories") else {
+        return Ok(());
+    };
+    let worktree = root
+        .entry("worktree".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let worktree = json_object_mut(path, worktree, "worktree")?;
+    worktree.insert(
+        "symlinkDirectories".to_owned(),
+        Value::Array(directories.clone()),
+    );
+    Ok(())
+}
+
+fn owned_claude_hooks_subset(
+    path: &Path,
+    hooks: &Value,
+    prefixes: &[String],
+) -> Result<Map<String, Value>, HarnessHookConfigError> {
+    let hooks = json_object(path, hooks, "hooks")?;
+    let mut hook_subset = Map::new();
+    for (stage, groups) in hooks {
+        let groups = json_array(path, groups, "hook stage")?;
+        let mut owned_groups = Vec::new();
+        for group in groups {
+            let group = json_object(path, group, "hook group")?;
+            let Some(hooks) = group.get("hooks") else {
+                continue;
+            };
+            let owned_hooks = json_array(path, hooks, "hook commands")?
+                .iter()
+                .filter(|hook| {
+                    hook.get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|command| is_owned_hook_command(command, prefixes))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if owned_hooks.is_empty() {
+                continue;
+            }
+            let mut owned_group = Map::new();
+            if let Some(matcher) = group.get("matcher") {
+                owned_group.insert("matcher".to_owned(), matcher.clone());
+            }
+            owned_group.insert("hooks".to_owned(), Value::Array(owned_hooks));
+            owned_groups.push(Value::Object(owned_group));
+        }
+        if !owned_groups.is_empty() {
+            hook_subset.insert(stage.clone(), Value::Array(owned_groups));
+        }
+    }
+    Ok(hook_subset)
+}
+
+fn parse_json_file(path: &Path, content: &str) -> Result<Value, HarnessHookConfigError> {
+    serde_json::from_str(content).map_err(|source| HarnessHookConfigError::InvalidJson {
         path: path.to_path_buf(),
         source,
     })
+}
+
+fn json_object<'a>(
+    path: &Path,
+    value: &'a Value,
+    label: &str,
+) -> Result<&'a Map<String, Value>, HarnessHookConfigError> {
+    value
+        .as_object()
+        .ok_or_else(|| HarnessHookConfigError::InvalidShape {
+            path: path.to_path_buf(),
+            message: format!("{label} must be an object"),
+        })
+}
+
+fn json_object_mut<'a>(
+    path: &Path,
+    value: &'a mut Value,
+    label: &str,
+) -> Result<&'a mut Map<String, Value>, HarnessHookConfigError> {
+    value
+        .as_object_mut()
+        .ok_or_else(|| HarnessHookConfigError::InvalidShape {
+            path: path.to_path_buf(),
+            message: format!("{label} must be an object"),
+        })
+}
+
+fn json_array<'a>(
+    path: &Path,
+    value: &'a Value,
+    label: &str,
+) -> Result<&'a Vec<Value>, HarnessHookConfigError> {
+    value
+        .as_array()
+        .ok_or_else(|| HarnessHookConfigError::InvalidShape {
+            path: path.to_path_buf(),
+            message: format!("{label} must be an array"),
+        })
+}
+
+fn json_array_mut<'a>(
+    path: &Path,
+    value: &'a mut Value,
+    label: &str,
+) -> Result<&'a mut Vec<Value>, HarnessHookConfigError> {
+    value
+        .as_array_mut()
+        .ok_or_else(|| HarnessHookConfigError::InvalidShape {
+            path: path.to_path_buf(),
+            message: format!("{label} must be an array"),
+        })
+}
+
+fn json_to_pretty_string(value: &Value) -> Result<String, HarnessHookConfigError> {
+    serde_json::to_string_pretty(value)
+        .map(|content| format!("{content}\n"))
+        .map_err(|error| HarnessHookConfigError::Custom {
+            message: format!("Failed to render JSON: {error}"),
+        })
+}
+
+fn write_codex_toml(
+    input: HarnessHookConfigWriteInput<'_>,
+) -> Result<String, HarnessHookConfigError> {
+    let Some(existing_content) = input.existing_content else {
+        return render_codex_toml(HarnessHookConfigRenderInput {
+            source_path: input.source_path,
+            target: input.target,
+            groups: input.groups,
+        });
+    };
+    if existing_content.trim().is_empty() {
+        return render_codex_toml(HarnessHookConfigRenderInput {
+            source_path: input.source_path,
+            target: input.target,
+            groups: input.groups,
+        });
+    }
+
+    let mut document = parse_toml_file(input.path, existing_content)?;
+    remove_owned_codex_hooks(&mut document, input.owned_command_prefixes);
+    merge_codex_features(&mut document, input.target)?;
+    append_generated_codex_hooks(&mut document, input.groups)?;
+    Ok(document.to_string())
+}
+
+fn check_codex_toml(
+    input: HarnessHookConfigCheckInput<'_>,
+) -> Result<HarnessHookConfigCheckProjection, HarnessHookConfigError> {
+    let actual_document = parse_toml_file(input.path, input.actual_content)?;
+    let expected = expected_codex_toml_subset(input.target, input.groups)?;
+    let actual =
+        actual_codex_toml_subset(&actual_document, input.owned_command_prefixes, input.target)?;
+    Ok(HarnessHookConfigCheckProjection { expected, actual })
+}
+
+fn expected_codex_toml_subset(
+    target: &HarnessTarget,
+    groups: &[HarnessHookGroup],
+) -> Result<String, HarnessHookConfigError> {
+    render_codex_toml(HarnessHookConfigRenderInput {
+        source_path: "",
+        target,
+        groups,
+    })
+}
+
+fn actual_codex_toml_subset(
+    document: &DocumentMut,
+    prefixes: &[String],
+    target: &HarnessTarget,
+) -> Result<String, HarnessHookConfigError> {
+    let mut subset = DocumentMut::new();
+    copy_owned_codex_features(document, &mut subset, target)?;
+    copy_owned_codex_hooks(document, &mut subset, prefixes)?;
+    Ok(subset.to_string())
+}
+
+fn parse_toml_file(path: &Path, content: &str) -> Result<DocumentMut, HarnessHookConfigError> {
+    content
+        .parse::<DocumentMut>()
+        .map_err(|source| HarnessHookConfigError::InvalidToml {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn remove_owned_codex_hooks(document: &mut DocumentMut, prefixes: &[String]) {
+    let Some(hooks) = document.get_mut("hooks").and_then(Item::as_table_mut) else {
+        return;
+    };
+    let stages = hooks
+        .iter()
+        .filter(|(_, item)| item.is_array_of_tables())
+        .map(|(stage, _)| stage.to_owned())
+        .collect::<Vec<_>>();
+    for stage in stages {
+        let remove_stage = hooks
+            .get_mut(&stage)
+            .and_then(Item::as_array_of_tables_mut)
+            .is_some_and(|stage_groups| {
+                prune_owned_toml_stage(stage_groups, prefixes);
+                stage_groups.is_empty()
+            });
+        if remove_stage {
+            hooks.remove(&stage);
+        }
+    }
+}
+
+fn prune_owned_toml_stage(stage_groups: &mut ArrayOfTables, prefixes: &[String]) {
+    for group in stage_groups.iter_mut() {
+        if let Some(hooks) = group
+            .get_mut("hooks")
+            .and_then(Item::as_array_of_tables_mut)
+        {
+            hooks.retain(|hook| {
+                hook.get("command")
+                    .and_then(Item::as_str)
+                    .is_none_or(|command| !is_owned_hook_command(command, prefixes))
+            });
+        }
+    }
+    stage_groups.retain(|group| {
+        group
+            .get("hooks")
+            .and_then(Item::as_array_of_tables)
+            .is_some_and(|hooks| !hooks.is_empty())
+    });
+}
+
+fn merge_codex_features(
+    document: &mut DocumentMut,
+    target: &HarnessTarget,
+) -> Result<(), HarnessHookConfigError> {
+    let Some(Value::Object(features)) = target.options.get("features") else {
+        return Ok(());
+    };
+    let features_table = ensure_toml_table(document.as_table_mut(), "features")?;
+    for (key, feature) in features {
+        if let Some(feature) = feature.as_bool() {
+            features_table.insert(key, value(feature));
+        }
+    }
+    Ok(())
+}
+
+fn append_generated_codex_hooks(
+    document: &mut DocumentMut,
+    groups: &[HarnessHookGroup],
+) -> Result<(), HarnessHookConfigError> {
+    let hooks_table = ensure_toml_implicit_table(document.as_table_mut(), "hooks")?;
+    for group in groups {
+        let mut group_table = Table::new();
+        if let Some(matcher) = &group.matcher {
+            group_table.insert("matcher", value(matcher.clone()));
+        }
+
+        let mut hook_tables = ArrayOfTables::new();
+        for hook in &group.hooks {
+            hook_tables.push(codex_hook_table(hook));
+        }
+        group_table.insert("hooks", Item::ArrayOfTables(hook_tables));
+
+        ensure_toml_array_of_tables(hooks_table, &group.stage)?.push(group_table);
+    }
+    Ok(())
+}
+
+fn copy_owned_codex_features(
+    source: &DocumentMut,
+    target: &mut DocumentMut,
+    harness_target: &HarnessTarget,
+) -> Result<(), HarnessHookConfigError> {
+    let Some(Value::Object(features)) = harness_target.options.get("features") else {
+        return Ok(());
+    };
+    for key in features.keys() {
+        if let Some(feature) = source
+            .get("features")
+            .and_then(Item::as_table)
+            .and_then(|features| features.get(key))
+            .and_then(Item::as_bool)
+        {
+            ensure_toml_table(target.as_table_mut(), "features")?.insert(key, value(feature));
+        }
+    }
+    Ok(())
+}
+
+fn copy_owned_codex_hooks(
+    source: &DocumentMut,
+    target: &mut DocumentMut,
+    prefixes: &[String],
+) -> Result<(), HarnessHookConfigError> {
+    let Some(hooks) = source.get("hooks").and_then(Item::as_table) else {
+        return Ok(());
+    };
+    let target_hooks = ensure_toml_implicit_table(target.as_table_mut(), "hooks")?;
+    for (stage, stage_groups) in hooks {
+        let Some(stage_groups) = stage_groups.as_array_of_tables() else {
+            continue;
+        };
+        for group in stage_groups.iter() {
+            let Some(hooks) = group.get("hooks").and_then(Item::as_array_of_tables) else {
+                continue;
+            };
+            let mut owned_hooks = ArrayOfTables::new();
+            for hook in hooks.iter() {
+                if hook
+                    .get("command")
+                    .and_then(Item::as_str)
+                    .is_some_and(|command| is_owned_hook_command(command, prefixes))
+                {
+                    owned_hooks.push(hook.clone());
+                }
+            }
+            if owned_hooks.is_empty() {
+                continue;
+            }
+
+            let mut group_table = Table::new();
+            if let Some(matcher) = group.get("matcher").and_then(Item::as_str) {
+                group_table.insert("matcher", value(matcher));
+            }
+            group_table.insert("hooks", Item::ArrayOfTables(owned_hooks));
+            ensure_toml_array_of_tables(target_hooks, stage)?.push(group_table);
+        }
+    }
+    Ok(())
+}
+
+fn ensure_toml_table<'a>(
+    table: &'a mut Table,
+    key: &str,
+) -> Result<&'a mut Table, HarnessHookConfigError> {
+    if !table.get(key).is_some_and(Item::is_table) {
+        table.insert(key, Item::Table(Table::new()));
+    }
+    table
+        .get_mut(key)
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| HarnessHookConfigError::Custom {
+            message: format!("Failed to create TOML table {key}"),
+        })
+}
+
+fn ensure_toml_implicit_table<'a>(
+    table: &'a mut Table,
+    key: &str,
+) -> Result<&'a mut Table, HarnessHookConfigError> {
+    let created = table.get(key).is_none();
+    let table = ensure_toml_table(table, key)?;
+    if created {
+        table.set_implicit(true);
+    }
+    Ok(table)
+}
+
+fn ensure_toml_array_of_tables<'a>(
+    table: &'a mut Table,
+    key: &str,
+) -> Result<&'a mut ArrayOfTables, HarnessHookConfigError> {
+    if !table.get(key).is_some_and(Item::is_array_of_tables) {
+        table.insert(key, Item::ArrayOfTables(ArrayOfTables::new()));
+    }
+    table
+        .get_mut(key)
+        .and_then(Item::as_array_of_tables_mut)
+        .ok_or_else(|| HarnessHookConfigError::Custom {
+            message: format!("Failed to create TOML array of tables {key}"),
+        })
+}
+
+fn codex_hook_table(hook: &HarnessHookCommand) -> Table {
+    let mut hook_table = Table::new();
+    hook_table.insert("type", value(hook.command_type.clone()));
+    hook_table.insert(
+        "command",
+        toml_literal_or_basic_string(&hook.command)
+            .parse::<Item>()
+            .unwrap_or_else(|_| value(hook.command.clone())),
+    );
+    hook_table.insert("timeout", value(i64::from(hook.timeout)));
+    hook_table.insert("statusMessage", value(hook.status_message.clone()));
+    hook_table
+}
+
+fn read_optional_to_string(path: &Path) -> Result<Option<String>, HarnessHookConfigError> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(HarnessHookConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -784,6 +1419,45 @@ mod tests {
         }
     }
 
+    fn single_harness_config(harness: &str) -> HarnessHookConfigSet {
+        let config = hook_config_set();
+        let target = config
+            .targets
+            .iter()
+            .find(|target| target.harness == harness)
+            .unwrap()
+            .clone();
+        let hook_config = config.hook_configs.get(harness).unwrap().clone();
+        let hooks = config
+            .hooks
+            .iter()
+            .filter_map(|hook| {
+                let bindings = hook
+                    .bindings
+                    .iter()
+                    .filter(|binding| binding.harness == harness)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if bindings.is_empty() {
+                    None
+                } else {
+                    Some(HookConfigCommand::new(
+                        hook.name.clone(),
+                        hook.stage,
+                        bindings,
+                    ))
+                }
+            })
+            .collect();
+
+        HarnessHookConfigSet {
+            source_path: config.source_path,
+            hook_configs: HarnessHookConfigRegistry::from([(harness.to_owned(), hook_config)]),
+            targets: vec![target],
+            hooks,
+        }
+    }
+
     #[test]
     fn renders_custom_codex_and_claude_native_hook_config_files() {
         let files = render_harness_hook_config_files(&hook_config_set()).unwrap();
@@ -792,7 +1466,7 @@ mod tests {
             files[0],
             HarnessHookFile {
                 path: ".fixture/hooks.json".to_owned(),
-                content: "{\n  \"groups\": [\n    {\n      \"hooks\": [\n        {\n          \"command\": \"agent-hooks fixture guard-example\",\n          \"mode\": \"changed-files\",\n          \"statusMessage\": \"Check Fixture\",\n          \"timeout\": 10\n        }\n      ],\n      \"matcher\": \"Bash\",\n      \"stage\": \"PreToolUse\"\n    }\n  ],\n  \"sourcePath\": \"agent-hooks.config.ts\"\n}\n".to_owned(),
+                content: "{\n  \"sourcePath\": \"agent-hooks.config.ts\",\n  \"groups\": [\n    {\n      \"stage\": \"PreToolUse\",\n      \"matcher\": \"Bash\",\n      \"hooks\": [\n        {\n          \"command\": \"agent-hooks fixture guard-example\",\n          \"timeout\": 10,\n          \"statusMessage\": \"Check Fixture\",\n          \"mode\": \"changed-files\"\n        }\n      ]\n    }\n  ]\n}\n".to_owned(),
             }
         );
         assert_eq!(
@@ -806,7 +1480,7 @@ mod tests {
             files[2],
             HarnessHookFile {
                 path: ".claude/settings.json".to_owned(),
-                content: "{\n  \"hooks\": {\n    \"PreToolUse\": [\n      {\n        \"matcher\": \"Bash\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"agent-hooks claude guard-example\",\n            \"timeout\": 10,\n            \"statusMessage\": \"Check Claude\"\n          }\n        ]\n      }\n    ],\n    \"Stop\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"agent-hooks claude summarize-session\",\n            \"timeout\": 5,\n            \"statusMessage\": \"Summarize Claude\"\n          }\n        ]\n      }\n    ]\n  },\n  \"worktree\": {\n    \"symlinkDirectories\": [\"node_modules\"]\n  }\n}\n".to_owned(),
+                content: "{\n  \"hooks\": {\n    \"PreToolUse\": [\n      {\n        \"matcher\": \"Bash\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"agent-hooks claude guard-example\",\n            \"timeout\": 10,\n            \"statusMessage\": \"Check Claude\"\n          }\n        ]\n      }\n    ],\n    \"Stop\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"agent-hooks claude summarize-session\",\n            \"timeout\": 5,\n            \"statusMessage\": \"Summarize Claude\"\n          }\n        ]\n      }\n    ]\n  },\n  \"worktree\": {\n    \"symlinkDirectories\": [\n      \"node_modules\"\n    ]\n  }\n}\n".to_owned(),
             }
         );
     }
@@ -817,7 +1491,12 @@ mod tests {
         let config = hook_config_set();
 
         for file in render_harness_hook_config_files(&config).unwrap() {
-            write_fixture_file(&root, &file.path, "drift\n");
+            let drift = match file.path.as_str() {
+                ".codex/config.toml" => "model = \"drift\"\n",
+                ".claude/settings.json" => "{}\n",
+                _ => "drift\n",
+            };
+            write_fixture_file(&root, &file.path, drift);
         }
 
         assert!(!check_harness_hook_config_files(&root, &config).unwrap().ok);
@@ -929,10 +1608,318 @@ mod tests {
         );
     }
 
+    #[test]
+    fn write_merges_claude_json_without_dropping_foreign_content() {
+        let root = test_root("claude-json-merge-foreign");
+        let config = single_harness_config("claude");
+        write_fixture_file(
+            &root,
+            ".claude/settings.json",
+            r#"{
+  "permissions": {
+    "allow": ["Bash(git status)"]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/my-hook.sh",
+            "timeout": 3,
+            "statusMessage": "Mine"
+          }
+        ]
+      }
+    ]
+  }
+}
+"#,
+        );
+
+        write_harness_hook_config_files(&root, &config).unwrap();
+        let settings = read_json_fixture(&root, ".claude/settings.json");
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(settings["permissions"]["allow"][0], "Bash(git status)");
+        assert!(value_contains_string(
+            &settings["hooks"],
+            "./scripts/my-hook.sh"
+        ));
+        assert!(value_contains_string(
+            &settings["hooks"],
+            "agent-hooks claude guard-example"
+        ));
+    }
+
+    #[test]
+    fn write_replaces_stale_owned_claude_json_entries() {
+        let root = test_root("claude-json-replace-owned");
+        let config = single_harness_config("claude");
+        write_fixture_file(
+            &root,
+            ".claude/settings.json",
+            r#"{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/my-hook.sh",
+            "timeout": 3,
+            "statusMessage": "Mine"
+          },
+          {
+            "type": "command",
+            "command": "agent-hooks claude stale-hook",
+            "timeout": 99,
+            "statusMessage": "Stale"
+          }
+        ]
+      }
+    ]
+  }
+}
+"#,
+        );
+
+        write_harness_hook_config_files(&root, &config).unwrap();
+        let settings = read_json_fixture(&root, ".claude/settings.json");
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert!(value_contains_string(
+            &settings["hooks"],
+            "./scripts/my-hook.sh"
+        ));
+        assert!(!value_contains_string(
+            &settings["hooks"],
+            "agent-hooks claude stale-hook"
+        ));
+        assert!(value_contains_string(
+            &settings["hooks"],
+            "agent-hooks claude guard-example"
+        ));
+    }
+
+    #[test]
+    fn write_is_idempotent_for_claude_json_and_codex_toml() {
+        let root = test_root("hook-config-idempotent");
+        let config = hook_config_set();
+
+        write_harness_hook_config_files(&root, &config).unwrap();
+        let first_claude = read_fixture_file(&root, ".claude/settings.json");
+        let first_codex = read_fixture_file(&root, ".codex/config.toml");
+        write_harness_hook_config_files(&root, &config).unwrap();
+        let second_claude = read_fixture_file(&root, ".claude/settings.json");
+        let second_codex = read_fixture_file(&root, ".codex/config.toml");
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(second_claude, first_claude);
+        assert_eq!(second_codex, first_codex);
+    }
+
+    #[test]
+    fn write_merges_codex_toml_without_dropping_comments_or_foreign_tables() {
+        let root = test_root("codex-toml-merge-foreign");
+        let config = single_harness_config("codex");
+        write_fixture_file(
+            &root,
+            ".codex/config.toml",
+            r#"# hand-authored comment
+model = "x"
+
+[tools]
+enabled = true
+
+[features]
+existing = true
+hooks = false
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = './scripts/my-hook.sh'
+timeout = 3
+statusMessage = "Mine"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'agent-hooks codex stale-hook'
+timeout = 99
+statusMessage = "Stale"
+"#,
+        );
+
+        write_harness_hook_config_files(&root, &config).unwrap();
+        let content = read_fixture_file(&root, ".codex/config.toml");
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert!(content.contains("# hand-authored comment"));
+        assert!(content.contains("model = \"x\""));
+        assert!(content.contains("[tools]\nenabled = true"));
+        assert!(content.contains("existing = true"));
+        assert!(content.contains("hooks = true"));
+        assert!(content.contains("command = './scripts/my-hook.sh'"));
+        assert!(!content.contains("agent-hooks codex stale-hook"));
+        assert!(content.contains("agent-hooks codex guard-example"));
+    }
+
+    #[test]
+    fn write_fails_fast_on_unparseable_json_and_toml_without_touching_files() {
+        let json_root = test_root("unparseable-json");
+        let json_config = single_harness_config("claude");
+        let invalid_json = "{ not json\n";
+        write_fixture_file(&json_root, ".claude/settings.json", invalid_json);
+
+        let json_error = write_harness_hook_config_files(&json_root, &json_config)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            json_error.contains(".claude/settings.json"),
+            "error should name JSON path: {json_error}"
+        );
+        assert_eq!(
+            read_fixture_file(&json_root, ".claude/settings.json"),
+            invalid_json
+        );
+        std::fs::remove_dir_all(json_root).unwrap();
+
+        let toml_root = test_root("unparseable-toml");
+        let toml_config = single_harness_config("codex");
+        let invalid_toml = "model = \n";
+        write_fixture_file(&toml_root, ".codex/config.toml", invalid_toml);
+
+        let toml_error = write_harness_hook_config_files(&toml_root, &toml_config)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            toml_error.contains(".codex/config.toml"),
+            "error should name TOML path: {toml_error}"
+        );
+        assert_eq!(
+            read_fixture_file(&toml_root, ".codex/config.toml"),
+            invalid_toml
+        );
+        std::fs::remove_dir_all(toml_root).unwrap();
+    }
+
+    #[test]
+    fn check_ignores_foreign_json_and_toml_content() {
+        let root = test_root("check-ignores-foreign");
+        let config = hook_config_set();
+        write_harness_hook_config_files(&root, &config).unwrap();
+
+        let mut settings = read_json_fixture(&root, ".claude/settings.json");
+        settings["permissions"] = json!({ "allow": ["Bash(git status)"] });
+        settings["hooks"]
+            .as_object_mut()
+            .unwrap()
+            .entry("PostToolUse".to_owned())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "matcher": "Edit",
+                "hooks": [{
+                    "type": "command",
+                    "command": "./scripts/my-hook.sh",
+                    "timeout": 3,
+                    "statusMessage": "Mine"
+                }]
+            }));
+        write_fixture_file(
+            &root,
+            ".claude/settings.json",
+            &(serde_json::to_string_pretty(&settings).unwrap() + "\n"),
+        );
+
+        let codex = read_fixture_file(&root, ".codex/config.toml");
+        write_fixture_file(
+            &root,
+            ".codex/config.toml",
+            &format!(
+                "# hand-authored comment\nmodel = \"x\"\n\n{codex}\n[[hooks.PreToolUse]]\nmatcher = \"^Bash$\"\n\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = './scripts/my-hook.sh'\ntimeout = 3\nstatusMessage = \"Mine\"\n"
+            ),
+        );
+
+        let result = check_harness_hook_config_files(&root, &config).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(
+            result,
+            HarnessHookConfigCheckResult {
+                ok: true,
+                mismatches: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn check_flags_edited_and_missing_owned_json_entries() {
+        let edited_root = test_root("check-edited-owned");
+        let config = single_harness_config("claude");
+        write_harness_hook_config_files(&edited_root, &config).unwrap();
+        let mut edited = read_json_fixture(&edited_root, ".claude/settings.json");
+        edited["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] = json!(99);
+        write_fixture_file(
+            &edited_root,
+            ".claude/settings.json",
+            &(serde_json::to_string_pretty(&edited).unwrap() + "\n"),
+        );
+
+        let edited_result = check_harness_hook_config_files(&edited_root, &config).unwrap();
+        std::fs::remove_dir_all(edited_root).unwrap();
+
+        assert!(!edited_result.ok);
+        assert_eq!(edited_result.mismatches[0].path, ".claude/settings.json");
+
+        let missing_root = test_root("check-missing-owned");
+        write_harness_hook_config_files(&missing_root, &config).unwrap();
+        let mut missing = read_json_fixture(&missing_root, ".claude/settings.json");
+        missing["hooks"].as_object_mut().unwrap().remove("Stop");
+        write_fixture_file(
+            &missing_root,
+            ".claude/settings.json",
+            &(serde_json::to_string_pretty(&missing).unwrap() + "\n"),
+        );
+
+        let missing_result = check_harness_hook_config_files(&missing_root, &config).unwrap();
+        std::fs::remove_dir_all(missing_root).unwrap();
+
+        assert!(!missing_result.ok);
+        assert_eq!(missing_result.mismatches[0].path, ".claude/settings.json");
+    }
+
     fn write_fixture_file(root: &Path, relative_path: &str, content: &str) {
         let file_path = root.join(relative_path);
         std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
         std::fs::write(file_path, content).unwrap();
+    }
+
+    fn read_fixture_file(root: &Path, relative_path: &str) -> String {
+        std::fs::read_to_string(root.join(relative_path)).unwrap()
+    }
+
+    fn read_json_fixture(root: &Path, relative_path: &str) -> Value {
+        serde_json::from_str(&read_fixture_file(root, relative_path)).unwrap()
+    }
+
+    fn value_contains_string(value: &Value, needle: &str) -> bool {
+        match value {
+            Value::String(value) => value == needle,
+            Value::Array(values) => values
+                .iter()
+                .any(|value| value_contains_string(value, needle)),
+            Value::Object(values) => values
+                .values()
+                .any(|value| value_contains_string(value, needle)),
+            _ => false,
+        }
     }
 
     fn test_root(label: &str) -> PathBuf {
