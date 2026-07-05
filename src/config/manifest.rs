@@ -828,10 +828,17 @@ fn manifest_tool_args(
         append_input_args(&mut args, ctx);
         return Some(args);
     }
-    if !tool.whole_program && ctx.files.is_empty() && !tool.targets.fallback.is_empty() {
-        replace_files_placeholder_or_append(&mut args, mode_args, &tool.targets.fallback);
-        append_input_args(&mut args, ctx);
-        return Some(args);
+    if is_file_scoped_tool(tool) && ctx.files.is_empty() {
+        let default_files = if tool.targets.fallback.is_empty() {
+            scope_zones_for_mode(mode, path_zones)
+        } else {
+            tool.targets.fallback.clone()
+        };
+        if !default_files.is_empty() {
+            replace_files_placeholder_or_append(&mut args, mode_args, &default_files);
+            append_input_args(&mut args, ctx);
+            return Some(args);
+        }
     }
     if !tool.whole_program && !ctx.files.is_empty() && files.is_empty() {
         return None;
@@ -855,6 +862,10 @@ fn manifest_tool_args(
         append_input_args(&mut args, ctx);
     }
     Some(args)
+}
+
+fn is_file_scoped_tool(tool: &ExecutableToolSpec) -> bool {
+    !tool.whole_program && !tool.script
 }
 
 fn append_input_args(args: &mut Vec<String>, ctx: &super::ExecutionContext) {
@@ -923,14 +934,21 @@ fn resolved_files(
     if ctx.files.is_empty() || tool.whole_program {
         return Vec::new();
     }
-    let mut files = if mode == ToolRunMode::Fix {
-        scoped_files(ctx, &path_zones.writable)
-    } else {
-        ctx.files
-            .iter()
-            .map(|file| normalize_file_path(file))
-            .collect()
+    let mut files = match mode {
+        ToolRunMode::Fix => scoped_files(ctx, &path_zones.writable),
+        ToolRunMode::Check => {
+            let check_scope = check_scope_zones(path_zones);
+            if check_scope.is_empty() {
+                ctx.files
+                    .iter()
+                    .map(|file| normalize_file_path(file))
+                    .collect()
+            } else {
+                scoped_files(ctx, &check_scope)
+            }
+        }
     };
+    files.retain(|file| !is_runweaver_generated_artifact(file));
     files.retain(|file| matches_tool_targets(&tool.targets, file));
     let mut affected = Vec::new();
     for file in &files {
@@ -950,6 +968,37 @@ fn scoped_files(ctx: &super::ExecutionContext, zones: &[String]) -> Vec<String> 
         .collect()
 }
 
+fn scope_zones_for_mode(mode: ToolRunMode, path_zones: &PathZonesManifest) -> Vec<String> {
+    match mode {
+        ToolRunMode::Check => check_scope_zones(path_zones),
+        ToolRunMode::Fix => dedup_zone_entries(path_zones.writable.iter()),
+    }
+}
+
+fn check_scope_zones(path_zones: &PathZonesManifest) -> Vec<String> {
+    dedup_zone_entries(
+        path_zones
+            .writable
+            .iter()
+            .chain(path_zones.check_only.iter()),
+    )
+}
+
+fn dedup_zone_entries<'a>(zones: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    zones
+        .into_iter()
+        .filter_map(|zone| {
+            let normalized = normalize_file_path(zone);
+            if seen.insert(normalized.clone()) {
+                Some(normalized)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn path_in_zone(file: &str, zone: &str) -> bool {
     let zone = normalize_file_path(zone);
     if zone.ends_with('/') {
@@ -957,6 +1006,26 @@ fn path_in_zone(file: &str, zone: &str) -> bool {
     } else {
         file == zone
     }
+}
+
+/// Paths runweaver itself generates or scaffolds inside `.runweaver/`;
+/// never valid check/fix targets for manifest tools.
+fn is_runweaver_generated_artifact(file: &str) -> bool {
+    let file = normalize_file_path(file);
+    matches!(
+        file.as_str(),
+        ".runweaver/manifest.json"
+            | ".runweaver/manifest.d.ts"
+            | ".runweaver/manifest.schema.json"
+            | ".runweaver/package.json"
+    ) || path_has_dir_prefix(&file, GENERATED_GIT_HOOKS_DIR)
+        || path_has_dir_prefix(&file, ".runweaver/bin")
+        || path_has_dir_prefix(&file, ".runweaver/node_modules")
+}
+
+fn path_has_dir_prefix(file: &str, dir: &str) -> bool {
+    file.strip_prefix(dir)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 fn matches_tool_targets(targets: &ToolTargets, file: &str) -> bool {
@@ -2061,6 +2130,78 @@ mod tests {
     fn assert_preset_targets(preset: &str, targets: ToolTargetsManifest, expected: ToolTargets) {
         let tool = preset_tool(preset, &[], Some(&targets), &[]);
         assert_eq!(tool.targets, expected);
+    }
+
+    fn recorder_tool() -> ExecutableToolSpec {
+        ExecutableToolSpec {
+            program: "recorder".to_owned(),
+            base_args: Vec::new(),
+            check_args: vec!["--check".to_owned()],
+            fix_args: None,
+            targets: ToolTargets::default(),
+            affected: Vec::new(),
+            parser: None,
+            script: false,
+            whole_program: false,
+        }
+    }
+
+    #[test]
+    fn is_runweaver_generated_artifact_matches_generated_manifest_outputs() {
+        let cases = [
+            (".runweaver/manifest.json", true),
+            (".runweaver/manifest.d.ts", true),
+            (".runweaver/manifest.schema.json", true),
+            (".runweaver/package.json", true),
+            (".runweaver/git-hooks/pre-commit", true),
+            (".runweaver/bin/runweaver", true),
+            (".runweaver/node_modules/.bin/oxlint", true),
+            (".runweaver/configs/oxlintrc.jsonc", false),
+            ("src/a.ts", false),
+        ];
+
+        for (file, expected) in cases {
+            assert_eq!(is_runweaver_generated_artifact(file), expected, "{file}");
+        }
+    }
+
+    #[test]
+    fn manifest_tool_args_defaults_file_scoped_check_tools_to_declared_path_zones() {
+        let zones = PathZonesManifest {
+            writable: strings(&["src/", "docs/"]),
+            check_only: strings(&["docs/", "examples/"]),
+            ..PathZonesManifest::default()
+        };
+
+        assert_eq!(
+            manifest_tool_args(
+                &recorder_tool(),
+                ToolRunMode::Check,
+                &zones,
+                &ExecutionContext::new(".")
+            ),
+            Some(strings(&["--check", "src/", "docs/", "examples/"]))
+        );
+    }
+
+    #[test]
+    fn resolved_files_scopes_check_mode_to_declared_check_path_zones() {
+        let zones = PathZonesManifest {
+            writable: strings(&["src/"]),
+            check_only: strings(&["docs/"]),
+            ..PathZonesManifest::default()
+        };
+        let ctx = ExecutionContext::new(".").with_files(strings(&[
+            "src/a.ts",
+            "docs/b.ts",
+            "vendor/c.ts",
+            ".runweaver/manifest.d.ts",
+        ]));
+
+        assert_eq!(
+            resolved_files(&recorder_tool(), ToolRunMode::Check, &zones, &ctx),
+            strings(&["docs/b.ts", "src/a.ts"])
+        );
     }
 
     #[test]

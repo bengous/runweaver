@@ -83,6 +83,73 @@ fn run_cli(root: &Path, args: &[&str], stdin: &str) -> CliRun {
     }
 }
 
+#[cfg(unix)]
+fn recorder_manifest(paths: Option<serde_json::Value>) -> serde_json::Value {
+    let mut manifest = serde_json::json!({
+        "version": 2,
+        "tools": {
+            "recorder": {
+                "check": ["recorder", "--check"],
+                "diagnostics": { "parser": "unix" }
+            }
+        },
+        "pipelines": {
+            "check": { "check": ["recorder"] }
+        },
+        "operations": {},
+        "surfaces": { "cli": true },
+        "bindings": []
+    });
+    if let Some(paths) = paths {
+        manifest
+            .as_object_mut()
+            .expect("manifest should be a json object")
+            .insert("paths".to_owned(), paths);
+    }
+    manifest
+}
+
+#[cfg(unix)]
+fn recorder_manifest_with_path_zones() -> serde_json::Value {
+    recorder_manifest(Some(serde_json::json!({
+        "writable": ["src/"],
+        "checkOnly": ["docs/"]
+    })))
+}
+
+#[cfg(unix)]
+fn install_recorder(root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin_dir = root.join("node_modules").join(".bin");
+    std::fs::create_dir_all(&bin_dir).expect("repo-local bin dir should be created");
+    let recorder = bin_dir.join("recorder");
+    std::fs::write(
+        &recorder,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > recorder-args.txt\nexit 0\n",
+    )
+    .expect("recorder should be written");
+    let mut permissions = std::fs::metadata(&recorder)
+        .expect("recorder metadata should be readable")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&recorder, permissions).expect("recorder should be executable");
+}
+
+fn write_project_file(root: &Path, path: &str, content: &str) {
+    let path = root.join(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("project file parent should be created");
+    }
+    std::fs::write(path, content).expect("project file should be written");
+}
+
+#[cfg(unix)]
+fn read_recorder_args(root: &Path) -> String {
+    std::fs::read_to_string(root.join("recorder-args.txt"))
+        .expect("recorder args should be written")
+}
+
 #[test]
 fn generic_cli_runs_manifest_pipelines_with_the_default_registry() {
     let root = temp_project("run", &generic_manifest());
@@ -95,6 +162,107 @@ fn generic_cli_runs_manifest_pipelines_with_the_default_registry() {
         "run check should succeed: stdout={} stderr={}",
         run.stdout, run.stderr
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn generic_cli_run_check_defaults_file_tool_args_to_declared_path_zones() {
+    let root = temp_project("recorder-zones", &recorder_manifest_with_path_zones());
+    install_recorder(&root);
+    write_project_file(&root, "src/a.ts", "");
+    write_project_file(&root, "vendor/b.ts", "");
+    write_project_file(&root, ".runweaver/manifest.d.ts", "");
+
+    let run = run_cli(&root, &["run", "check"], "");
+    let recorded = read_recorder_args(&root);
+    std::fs::remove_dir_all(&root).expect("temp project root should be removed");
+
+    assert_eq!(
+        run.exit_code, 0,
+        "run check should succeed: stdout={} stderr={}",
+        run.stdout, run.stderr
+    );
+    assert_eq!(recorded, "--check\nsrc/\ndocs/\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn generic_cli_run_check_scopes_explicit_files_to_declared_path_zones() {
+    let root = temp_project(
+        "recorder-explicit-zones",
+        &recorder_manifest_with_path_zones(),
+    );
+    install_recorder(&root);
+    write_project_file(&root, "src/a.ts", "");
+    write_project_file(&root, "vendor/b.ts", "");
+
+    let run = run_cli(
+        &root,
+        &["run", "check", "--files", "src/a.ts,vendor/b.ts"],
+        "",
+    );
+    let recorded = read_recorder_args(&root);
+    std::fs::remove_dir_all(&root).expect("temp project root should be removed");
+
+    assert_eq!(
+        run.exit_code, 0,
+        "run check should succeed: stdout={} stderr={}",
+        run.stdout, run.stderr
+    );
+    assert_eq!(recorded, "--check\nsrc/a.ts\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn generic_cli_run_check_excludes_runweaver_generated_artifacts_from_explicit_files() {
+    let root = temp_project(
+        "recorder-generated-artifact",
+        &recorder_manifest_with_path_zones(),
+    );
+    install_recorder(&root);
+    write_project_file(&root, "src/a.ts", "");
+    write_project_file(&root, ".runweaver/manifest.d.ts", "");
+
+    let run = run_cli(
+        &root,
+        &[
+            "run",
+            "check",
+            "--files",
+            ".runweaver/manifest.d.ts,src/a.ts",
+        ],
+        "",
+    );
+    let recorded = read_recorder_args(&root);
+    std::fs::remove_dir_all(&root).expect("temp project root should be removed");
+
+    assert_eq!(
+        run.exit_code, 0,
+        "run check should succeed: stdout={} stderr={}",
+        run.stdout, run.stderr
+    );
+    assert_eq!(recorded, "--check\nsrc/a.ts\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn generic_cli_run_check_keeps_whole_tree_behavior_without_declared_paths() {
+    let root = temp_project("recorder-no-zones", &recorder_manifest(None));
+    install_recorder(&root);
+    write_project_file(&root, "src/a.ts", "");
+    write_project_file(&root, "vendor/b.ts", "");
+    write_project_file(&root, ".runweaver/manifest.d.ts", "");
+
+    let run = run_cli(&root, &["run", "check"], "");
+    let recorded = read_recorder_args(&root);
+    std::fs::remove_dir_all(&root).expect("temp project root should be removed");
+
+    assert_eq!(
+        run.exit_code, 0,
+        "run check should succeed: stdout={} stderr={}",
+        run.stdout, run.stderr
+    );
+    assert_eq!(recorded, "--check\n");
 }
 
 #[test]
