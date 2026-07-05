@@ -858,6 +858,7 @@ fn run_sync_manifest(cwd: &Path, io: &mut RunweaverCliIo<'_>) -> Result<i32> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, content)?;
+    writeln!(io.stdout, "Wrote {}", relative_path(cwd, &path))?;
     Ok(0)
 }
 
@@ -2498,7 +2499,7 @@ mod tests {
             fs::read_to_string(root.join(".runweaver/manifest.json")).unwrap(),
             valid_manifest_json_stable()
         );
-        assert_eq!(captured.stdout(), "");
+        assert_eq!(captured.stdout(), "Wrote .runweaver/manifest.json\n");
         fs::remove_dir_all(root).unwrap();
     }
 
