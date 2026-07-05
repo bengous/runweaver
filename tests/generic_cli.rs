@@ -119,8 +119,6 @@ fn recorder_manifest_with_path_zones() -> serde_json::Value {
 
 #[cfg(unix)]
 fn install_recorder(root: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-
     let bin_dir = root.join("node_modules").join(".bin");
     std::fs::create_dir_all(&bin_dir).expect("repo-local bin dir should be created");
     let recorder = bin_dir.join("recorder");
@@ -129,11 +127,18 @@ fn install_recorder(root: &Path) {
         "#!/bin/sh\nprintf '%s\\n' \"$@\" > recorder-args.txt\nexit 0\n",
     )
     .expect("recorder should be written");
-    let mut permissions = std::fs::metadata(&recorder)
-        .expect("recorder metadata should be readable")
+    make_executable(&recorder);
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path)
+        .expect("executable metadata should be readable")
         .permissions();
     permissions.set_mode(0o755);
-    std::fs::set_permissions(&recorder, permissions).expect("recorder should be executable");
+    std::fs::set_permissions(path, permissions).expect("file should be executable");
 }
 
 fn write_project_file(root: &Path, path: &str, content: &str) {
@@ -177,6 +182,55 @@ fn append_claude_user_hook(root: &Path) {
 fn read_recorder_args(root: &Path) -> String {
     std::fs::read_to_string(root.join("recorder-args.txt"))
         .expect("recorder args should be written")
+}
+
+#[cfg(unix)]
+fn run_git(root: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("git should run");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: stdout={} stderr={}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+fn install_local_runweaver_binary(root: &Path) {
+    let target = root.join(".runweaver/bin/runweaver");
+    std::fs::create_dir_all(target.parent().expect("binary should have a parent"))
+        .expect("runweaver bin dir should be created");
+    std::fs::copy(env!("CARGO_BIN_EXE_runweaver"), &target)
+        .expect("runweaver binary should be copied");
+    make_executable(&target);
+}
+
+#[cfg(unix)]
+fn chain_hooks_manifest(check_script: &str) -> serde_json::Value {
+    let mut manifest = generic_manifest();
+    manifest["tools"]["echoCheck"]["script"] = serde_json::json!(check_script);
+    manifest["surfaces"]["git"]["chainHooksDir"] = serde_json::json!(".githooks");
+    manifest
+}
+
+#[cfg(unix)]
+fn setup_chained_git_hook_project(label: &str, check_script: &str) -> PathBuf {
+    let root = temp_project(label, &chain_hooks_manifest(check_script));
+    run_git(&root, &["init"]);
+    run_git(&root, &["config", "core.hooksPath", ".runweaver/git-hooks"]);
+    write_project_file(
+        &root,
+        ".githooks/pre-commit",
+        "#!/bin/sh\necho chained > chained.txt\n",
+    );
+    make_executable(&root.join(".githooks/pre-commit"));
+    install_local_runweaver_binary(&root);
+    root
 }
 
 #[test]
@@ -325,6 +379,58 @@ fn generic_cli_syncs_native_hook_configs_and_git_hooks() {
         pre_commit.contains("exec runweaver git-hook pre-commit"),
         "git pre-commit should fall back to the generic binary on PATH: {pre_commit}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn generic_cli_git_hooks_chain_to_existing_hooks_directory() {
+    let root = setup_chained_git_hook_project("git-hook-chain", "echo ok");
+    let sync = run_cli(&root, &["sync", "hooks"], "");
+    assert_eq!(
+        sync.exit_code, 0,
+        "sync hooks should succeed: stdout={} stderr={}",
+        sync.stdout, sync.stderr
+    );
+
+    let hook = std::process::Command::new(root.join(".runweaver/git-hooks/pre-commit"))
+        .current_dir(&root)
+        .output()
+        .expect("generated pre-commit hook should run");
+    assert!(
+        hook.status.success(),
+        "generated hook should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&hook.stdout),
+        String::from_utf8_lossy(&hook.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("chained.txt"))
+            .expect("chained hook should write output"),
+        "chained\n"
+    );
+    std::fs::remove_dir_all(&root).expect("temp project root should be removed");
+
+    let failing_root = setup_chained_git_hook_project("git-hook-chain-fail", "exit 1");
+    let sync = run_cli(&failing_root, &["sync", "hooks"], "");
+    assert_eq!(
+        sync.exit_code, 0,
+        "sync hooks should succeed: stdout={} stderr={}",
+        sync.stdout, sync.stderr
+    );
+    let hook = std::process::Command::new(failing_root.join(".runweaver/git-hooks/pre-commit"))
+        .current_dir(&failing_root)
+        .output()
+        .expect("generated pre-commit hook should run");
+    assert!(
+        !hook.status.success(),
+        "generated hook should stop on runweaver failure: stdout={} stderr={}",
+        String::from_utf8_lossy(&hook.stdout),
+        String::from_utf8_lossy(&hook.stderr)
+    );
+    assert!(
+        !failing_root.join("chained.txt").exists(),
+        "chained hook should not run after runweaver failure"
+    );
+    std::fs::remove_dir_all(&failing_root).expect("temp project root should be removed");
 }
 
 #[test]

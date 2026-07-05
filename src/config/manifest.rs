@@ -218,6 +218,12 @@ pub struct GitSurfaceManifest {
     pub pre_push: Option<GitPipelineSlotManifest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_commit: Option<GitToolSlotManifest>,
+    /// Directory of pre-existing hooks to chain after the generated hooks
+    /// (repo-relative, e.g. ".githooks"). Each generated hook runs its
+    /// runweaver slot first, then execs `<chainHooksDir>/<slot>` when present
+    /// and executable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_hooks_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -521,6 +527,7 @@ pub fn load_runweaver_manifest(
             expected: RUNWEAVER_DEFINITION_MANIFEST_VERSION,
         });
     }
+    validate_git_chain_hooks_dir(manifest)?;
 
     let mut missing = MissingBuiltins::default();
     let mut definition = RunweaverDefinition::new();
@@ -579,6 +586,31 @@ pub fn load_runweaver_manifest(
         generated_surface_files,
         surfaces: manifest.surfaces.clone(),
     })
+}
+
+fn validate_git_chain_hooks_dir(
+    manifest: &RunweaverDefinitionManifest,
+) -> Result<(), ManifestLoadError> {
+    let Some(chain_hooks_dir) = manifest
+        .surfaces
+        .as_ref()
+        .and_then(|surfaces| surfaces.git.as_ref())
+        .and_then(|git| git.chain_hooks_dir.as_deref())
+    else {
+        return Ok(());
+    };
+
+    if chain_hooks_dir.is_empty()
+        || Path::new(chain_hooks_dir).is_absolute()
+        || chain_hooks_dir.contains("..")
+    {
+        return Err(ManifestLoadError::InvalidDefinition(
+            "surfaces.git.chainHooksDir must be a non-empty repo-relative path without `..`."
+                .to_owned(),
+        ));
+    }
+
+    Ok(())
 }
 
 pub fn runweaver_manifest_json_schema() -> serde_json::Value {
@@ -1913,28 +1945,29 @@ fn render_git_hook_files(
     project_binary: &RunweaverProjectBinary,
 ) -> Vec<GeneratedSurfaceFile> {
     let mut files = Vec::new();
+    let chain_hooks_dir = git.chain_hooks_dir.as_deref();
     if git.pre_commit.is_some() {
         files.push(git_hook_file(
             "pre-commit",
-            render_git_pre_commit_hook(project_binary),
+            render_git_pre_commit_hook(project_binary, chain_hooks_dir),
         ));
     }
     if git.commit_msg.is_some() {
         files.push(git_hook_file(
             "commit-msg",
-            render_git_commit_msg_hook(project_binary),
+            render_git_commit_msg_hook(project_binary, chain_hooks_dir),
         ));
     }
     if git.pre_push.is_some() {
         files.push(git_hook_file(
             "pre-push",
-            render_git_pre_push_hook(project_binary),
+            render_git_pre_push_hook(project_binary, chain_hooks_dir),
         ));
     }
     if git.post_commit.is_some() {
         files.push(git_hook_file(
             "post-commit",
-            render_git_post_commit_hook(project_binary),
+            render_git_post_commit_hook(project_binary, chain_hooks_dir),
         ));
     }
     files
@@ -1948,30 +1981,44 @@ fn git_hook_file(name: &str, content: String) -> GeneratedSurfaceFile {
     }
 }
 
-fn render_git_pre_commit_hook(project_binary: &RunweaverProjectBinary) -> String {
-    git_hook_script("pre-commit", "", project_binary)
+fn render_git_pre_commit_hook(
+    project_binary: &RunweaverProjectBinary,
+    chain_hooks_dir: Option<&str>,
+) -> String {
+    git_hook_script("pre-commit", "", project_binary, chain_hooks_dir)
 }
 
-fn render_git_commit_msg_hook(project_binary: &RunweaverProjectBinary) -> String {
+fn render_git_commit_msg_hook(
+    project_binary: &RunweaverProjectBinary,
+    chain_hooks_dir: Option<&str>,
+) -> String {
     git_hook_script(
         "commit-msg",
         "\"${1:?commit message file is required}\"",
         project_binary,
+        chain_hooks_dir,
     )
 }
 
-fn render_git_pre_push_hook(project_binary: &RunweaverProjectBinary) -> String {
-    git_hook_script("pre-push", "", project_binary)
+fn render_git_pre_push_hook(
+    project_binary: &RunweaverProjectBinary,
+    chain_hooks_dir: Option<&str>,
+) -> String {
+    git_hook_script("pre-push", "", project_binary, chain_hooks_dir)
 }
 
-fn render_git_post_commit_hook(project_binary: &RunweaverProjectBinary) -> String {
-    git_hook_script("post-commit", "", project_binary)
+fn render_git_post_commit_hook(
+    project_binary: &RunweaverProjectBinary,
+    chain_hooks_dir: Option<&str>,
+) -> String {
+    git_hook_script("post-commit", "", project_binary, chain_hooks_dir)
 }
 
 fn git_hook_script(
     slot: &str,
     extra_args: &str,
     project_binary: &RunweaverProjectBinary,
+    chain_hooks_dir: Option<&str>,
 ) -> String {
     let suffix = if extra_args.is_empty() {
         String::new()
@@ -1983,11 +2030,29 @@ fn git_hook_script(
         "  canonical_binary=\"$canonical_root/{}\"",
         project_binary.out_path
     );
+    let chains_hook = chain_hooks_dir.is_some();
+    let local_invocation = if chains_hook {
+        "  \"$local_binary\" git-hook {slot}{suffix}"
+    } else {
+        "  exec \"$local_binary\" git-hook {slot}{suffix}"
+    };
+    let canonical_invocation = if chains_hook {
+        "  \"$canonical_binary\" git-hook {slot}{suffix}"
+    } else {
+        "  exec \"$canonical_binary\" git-hook {slot}{suffix}"
+    };
     let fallback = format!(
-        "  exec {} git-hook {{slot}}{{suffix}}",
+        "  {}{} git-hook {{slot}}{{suffix}}",
+        if chains_hook { "" } else { "exec " },
         project_binary.fallback_command
     );
-    [
+    let chain_hook = chain_hooks_dir.map(|chain_hooks_dir| {
+        format!(
+            "chain_hook=\"$repo_root/{}/{{slot}}\"",
+            shell_double_quoted_fragment(chain_hooks_dir)
+        )
+    });
+    let mut lines = vec![
         "#!/usr/bin/env sh",
         "set -eu",
         "",
@@ -2019,17 +2084,41 @@ fn git_hook_script(
         "fi",
         "",
         "if [ -x \"$local_binary\" ]; then",
-        "  exec \"$local_binary\" git-hook {slot}{suffix}",
+        local_invocation,
         "elif [ -n \"$canonical_binary\" ] && [ -x \"$canonical_binary\" ]; then",
-        "  exec \"$canonical_binary\" git-hook {slot}{suffix}",
+        canonical_invocation,
         "else",
         &fallback,
         "fi",
         "",
-    ]
-    .join("\n")
-    .replace("{slot}", slot)
-    .replace("{suffix}", &suffix)
+    ];
+    if let Some(chain_hook) = chain_hook.as_deref() {
+        lines.extend([
+            chain_hook,
+            "if [ -x \"$chain_hook\" ]; then",
+            "  exec \"$chain_hook\" \"$@\"",
+            "fi",
+            "",
+        ]);
+    }
+    lines
+        .join("\n")
+        .replace("{slot}", slot)
+        .replace("{suffix}", &suffix)
+}
+
+fn shell_double_quoted_fragment(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '$' => escaped.push_str("\\$"),
+            '`' => escaped.push_str("\\`"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn render_github_pull_request_workflow(
@@ -3030,6 +3119,176 @@ mod tests {
         assert_eq!(surfaces.cli, Some(true));
     }
 
+    fn git_surface_manifest(
+        chain_hooks_dir: Option<&str>,
+        commit_msg: bool,
+    ) -> RunweaverDefinitionManifest {
+        let mut git = serde_json::json!({
+            "preCommit": { "run": "check" }
+        });
+        if commit_msg {
+            git["commitMsg"] = serde_json::json!({ "tool": "echoCheck" });
+        }
+        if let Some(chain_hooks_dir) = chain_hooks_dir {
+            git["chainHooksDir"] = serde_json::json!(chain_hooks_dir);
+        }
+
+        serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "tools": {
+                "echoCheck": { "script": "true" }
+            },
+            "pipelines": {
+                "check": { "check": ["echoCheck"] }
+            },
+            "operations": {},
+            "surfaces": {
+                "git": git
+            },
+            "bindings": []
+        }))
+        .expect("git surface manifest should deserialize")
+    }
+
+    fn generated_file<'a>(
+        files: &'a [GeneratedSurfaceFile],
+        path: &str,
+    ) -> &'a GeneratedSurfaceFile {
+        files
+            .iter()
+            .find(|file| file.path == path)
+            .expect("generated file should exist")
+    }
+
+    #[test]
+    fn generated_git_hooks_chain_to_declared_hooks_dir() {
+        let manifest = git_surface_manifest(Some(".githooks"), true);
+        let loaded = load_runweaver_manifest(
+            &manifest,
+            &default_builtin_registry(),
+            &test_project_binary(),
+        )
+        .expect("manifest should load");
+        let pre_commit = generated_file(
+            &loaded.generated_surface_files,
+            ".runweaver/git-hooks/pre-commit",
+        );
+        let commit_msg = generated_file(
+            &loaded.generated_surface_files,
+            ".runweaver/git-hooks/commit-msg",
+        );
+
+        assert!(
+            pre_commit
+                .content
+                .contains("  \"$local_binary\" git-hook pre-commit\n"),
+            "pre-commit should run the local binary before chaining: {}",
+            pre_commit.content
+        );
+        assert!(
+            !pre_commit
+                .content
+                .contains("exec \"$local_binary\" git-hook pre-commit"),
+            "pre-commit should not exec runweaver before chaining: {}",
+            pre_commit.content
+        );
+        assert!(
+            pre_commit.content.contains(
+                "chain_hook=\"$repo_root/.githooks/pre-commit\"\nif [ -x \"$chain_hook\" ]; then\n  exec \"$chain_hook\" \"$@\"\nfi\n"
+            ),
+            "pre-commit should exec the chained hook when present: {}",
+            pre_commit.content
+        );
+        assert!(
+            commit_msg.content.contains(
+                "chain_hook=\"$repo_root/.githooks/commit-msg\"\nif [ -x \"$chain_hook\" ]; then\n  exec \"$chain_hook\" \"$@\"\nfi\n"
+            ),
+            "commit-msg should forward Git's original args to the chained hook: {}",
+            commit_msg.content
+        );
+    }
+
+    #[test]
+    fn generated_git_hooks_without_chain_dir_are_unchanged() {
+        let manifest = git_surface_manifest(None, false);
+        let loaded = load_runweaver_manifest(
+            &manifest,
+            &default_builtin_registry(),
+            &test_project_binary(),
+        )
+        .expect("manifest should load");
+        let pre_commit = generated_file(
+            &loaded.generated_surface_files,
+            ".runweaver/git-hooks/pre-commit",
+        );
+
+        assert_eq!(
+            pre_commit.content,
+            r#"#!/usr/bin/env sh
+set -eu
+
+# Worktree hook env isolation: let nested git commands rediscover cwd.
+git_local_env="$(git rev-parse --local-env-vars 2>/dev/null || true)"
+if [ -n "$git_local_env" ]; then
+  unset $git_local_env
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+common_git_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+absolute_common_git_dir=""
+case "$common_git_dir" in
+  /*) absolute_common_git_dir="$common_git_dir" ;;
+  .git) absolute_common_git_dir="$repo_root/.git" ;;
+  "") absolute_common_git_dir="" ;;
+  *) absolute_common_git_dir="$repo_root/$common_git_dir" ;;
+esac
+canonical_root=""
+case "$absolute_common_git_dir" in
+  */.git) canonical_root="$(dirname "$absolute_common_git_dir")" ;;
+esac
+
+cd "$repo_root"
+local_binary="$repo_root/.runweaver/bin/demo"
+canonical_binary=""
+if [ -n "$canonical_root" ]; then
+  canonical_binary="$canonical_root/.runweaver/bin/demo"
+fi
+
+if [ -x "$local_binary" ]; then
+  exec "$local_binary" git-hook pre-commit
+elif [ -n "$canonical_binary" ] && [ -x "$canonical_binary" ]; then
+  exec "$canonical_binary" git-hook pre-commit
+else
+  exec cargo run --quiet -p demo-rs -- git-hook pre-commit
+fi
+"#
+        );
+        assert!(!pre_commit.content.contains("chain_hook"));
+        assert!(
+            pre_commit
+                .content
+                .contains("exec \"$local_binary\" git-hook pre-commit")
+        );
+    }
+
+    #[test]
+    fn load_manifest_rejects_invalid_chain_hooks_dir() {
+        for chain_hooks_dir in ["/abs", "../up", ""] {
+            let manifest = git_surface_manifest(Some(chain_hooks_dir), false);
+            let error = load_runweaver_manifest(
+                &manifest,
+                &default_builtin_registry(),
+                &test_project_binary(),
+            )
+            .expect_err("invalid chainHooksDir should fail manifest load");
+
+            assert!(
+                error.to_string().contains("chainHooksDir"),
+                "error should name chainHooksDir for {chain_hooks_dir:?}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn generated_git_hook_scripts_invoke_project_binary_and_commit_msg_trailing_arg() {
         let manifest = RunweaverDefinitionManifest {
@@ -3055,6 +3314,7 @@ mod tests {
                     post_commit: Some(GitToolSlotManifest {
                         tool: "installAgentConfig".to_owned(),
                     }),
+                    chain_hooks_dir: None,
                 }),
                 ci: Some(CiSurfaceManifest {
                     github: Some(GithubCiSurfaceManifest {

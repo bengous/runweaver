@@ -1,6 +1,6 @@
 // Generated from the Runweaver manifest JSON schema. Do not edit.
 // Regenerate with: runweaver manifest types
-// schema-sha256: 07faf47d550c2df67dd780522fcf50e1c49c7c7a58245d1c463bfb9993ed6b38
+// schema-sha256: cfdfb184730a8118b89b47cbb90f693828ca73f2b6f2589d411e1afef695fe33
 
 export type RunweaverOperationDefinitionManifest = {
   builtin: string;
@@ -147,6 +147,10 @@ export interface GithubCiSurfaceManifest {
   [k: string]: unknown;
 }
 export interface GitSurfaceManifest {
+  /**
+   * Directory of pre-existing hooks to chain after the generated hooks (repo-relative, e.g. ".githooks"). Each generated hook runs its runweaver slot first, then execs `<chainHooksDir>/<slot>` when present and executable.
+   */
+  chainHooksDir?: string | null;
   commitMsg?: GitToolSlotManifest | null;
   postCommit?: GitToolSlotManifest | null;
   preCommit?: GitPreCommitSlotManifest | null;
