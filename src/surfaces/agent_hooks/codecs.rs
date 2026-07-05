@@ -116,10 +116,14 @@ fn decode_claude_hook(stdin: &str, stage: HookStage) -> Result<HookRequest> {
     let session_id = require_string(&value, "session_id", "Claude")?;
     let transcript_path = require_string(&value, "transcript_path", "Claude")?;
     let cwd = require_string(&value, "cwd", "Claude")?;
+    // Claude Code sends `tool_use_id` on PreToolUse/PostToolUse today, but the
+    // published hooks schema does not list it (Anthropic declined to guarantee
+    // it in anthropics/claude-code#13241), so absence is tolerated rather than
+    // rejected.
     let tool_call_id = match stage {
         HookStage::Stop => None,
         HookStage::PreTool | HookStage::PostEdit => {
-            Some(require_string(&value, "tool_use_id", "Claude")?)
+            optional_string(&value, "tool_use_id", "Claude")?
         }
     };
     let tool_name = match stage {
@@ -869,6 +873,55 @@ mod tests {
                 .and_then(|value| value.get("filePath")),
             Some(&json!("/repo/src/lib.rs"))
         );
+    }
+
+    #[test]
+    fn claude_decodes_pre_tool_payload_without_tool_use_id() {
+        let request = ClaudeCodec
+            .decode(
+                &json!({
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "session-123",
+                    "transcript_path": "/tmp/transcript.jsonl",
+                    "cwd": "/repo",
+                    "tool_name": "Bash",
+                    "tool_input": { "command": "cargo test" }
+                })
+                .to_string(),
+                HookStage::PreTool,
+                &HookEnv::new(),
+            )
+            .expect("Claude PreToolUse payload without tool_use_id should decode");
+
+        assert!(request.event.tool_call_id.is_none());
+        assert_eq!(request.event.tool_command.as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn claude_decodes_post_edit_payload_without_tool_use_id() {
+        let request = ClaudeCodec
+            .decode(
+                &json!({
+                    "hook_event_name": "PostToolUse",
+                    "session_id": "session-123",
+                    "transcript_path": "/tmp/transcript.jsonl",
+                    "cwd": "/repo",
+                    "tool_name": "Write",
+                    "tool_input": { "file_path": "src/lib.rs" },
+                    "tool_response": {
+                        "filePath": "/repo/src/lib.rs",
+                        "content": "pub fn main() {}\n"
+                    }
+                })
+                .to_string(),
+                HookStage::PostEdit,
+                &HookEnv::new(),
+            )
+            .expect("Claude PostToolUse payload without tool_use_id should decode");
+
+        assert_eq!(request.event.stage, HookStage::PostEdit);
+        assert!(request.event.tool_call_id.is_none());
+        assert_eq!(request.event.tool_name.as_deref(), Some("Write"));
     }
 
     #[test]
