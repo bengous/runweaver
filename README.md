@@ -22,25 +22,113 @@ Runweaver keeps the user-facing model to four concepts.
 - **Surface** defines where a pipeline is consumed, including input scoping and
   projection into an agent hook, Git hook, CI job, or CLI command.
 
-Everything else is library machinery: manifests, operations, profiles, codecs,
+Everything else is library machinery: manifests, operations, profiles,
 runtime services, bindings, and generated files.
 
 ## Architecture
 
-The intended hot path is data-driven:
+The hot path is data-driven:
 
 ```text
-config (TypeScript data literal)
-  -- runweaver sync --> manifest (JSON)
-  -- read at startup --> generic Rust binary
+runweaver.config.ts (closure-free TypeScript data literal)
+  -- evaluated by bun, piped as JSON --> runweaver sync manifest
+  -- .runweaver/manifest.json, read at startup --> generic Rust binary
 ```
 
-The TypeScript layer is a closure-free data literal evaluated at sync time.
-The manifest is pure JSON. The Rust binary reads that manifest at startup and
-executes the selected surface without evaluating TypeScript during hooks.
+The TypeScript layer is a plain data literal typed with `satisfies` against
+generated declarations. Runweaver never evaluates TypeScript: `runweaver sync
+manifest` reads JSON from stdin, validates it against the manifest schema, and
+writes `.runweaver/manifest.json`. The Rust binary reads that manifest at
+startup and executes the selected surface; no TypeScript runs during hooks.
 
-The orchestrator target is under 5 ms over invoking the underlying tool
-directly. Tool startup time belongs to the tool, not to Runweaver.
+## Authoring a Manifest
+
+`runweaver manifest types` writes `.runweaver/manifest.d.ts`, TypeScript
+declarations generated from the Rust manifest JSON schema. The Rust schema is
+the single source of truth; rerun the command after upgrading `runweaver` to
+pick up schema changes (the `schema-sha256` stamp in the banner identifies the
+generating schema). There is no published npm package.
+
+End to end:
+
+```console
+$ runweaver manifest types
+Wrote .runweaver/manifest.d.ts
+```
+
+`runweaver.config.ts` — a data literal that prints itself as JSON:
+
+```typescript
+import type { RunweaverDefinitionManifest } from "./.runweaver/manifest.d.ts";
+
+const manifest = {
+  version: 2,
+  paths: { writable: ["src/"] },
+  tools: {
+    fmtCheck: { script: "cargo fmt --check" },
+  },
+  pipelines: {
+    check: { check: ["fmtCheck"] },
+  },
+  operations: {},
+  surfaces: {
+    agents: {
+      harnesses: ["claude", "codex"],
+      preTool: [{ guard: "destructive-commands" }],
+      stop: { run: "check" },
+    },
+    git: { preCommit: { run: "check" } },
+    cli: true,
+  },
+  bindings: [],
+} satisfies RunweaverDefinitionManifest;
+
+console.log(JSON.stringify(manifest));
+```
+
+Sync, then run:
+
+```console
+$ bun run runweaver.config.ts | runweaver sync manifest
+Wrote .runweaver/manifest.json
+$ runweaver run check
+check: success
+```
+
+`bun run` evaluates but does not typecheck; the `satisfies` clause is enforced
+by the editor or `bunx tsc --noEmit --strict runweaver.config.ts`. Drift
+between config and committed manifest is detected the same way it is written:
+
+```console
+$ bun run runweaver.config.ts | runweaver check manifest
+```
+
+The default builtin registry ships two harnesses (Claude, Codex) and the
+`destructive-commands` guard. Custom operations require compiling a project
+binary (see below).
+
+## Performance
+
+The orchestrator target is under 5 ms of overhead over invoking the underlying
+tool directly, and the measurements substantiate it. On a warm Linux
+workstation (median of 100 iterations after 10 warmups, release build,
+`scripts/bench-hot-path.py`), the generic binary added 1.4–2 ms of
+orchestrator overhead over the matching bare-spawn baseline (`/usr/bin/true`
+for hook dispatch, `sh -c true` for task and Git pre-commit runs), landing at
+2–3 ms end to end per invocation. That overhead includes a full manifest
+re-parse and re-validation every time. Manifest load scales sub-linearly: a
+10x manifest (100 tools, 100 pipelines) added 0.5–0.75 ms across runs. p95
+stayed under 5 ms end to end in every measured scenario. Exact numbers vary
+run to run.
+
+Reproduce with:
+
+```console
+$ cargo build --release
+$ python3 scripts/bench-hot-path.py target/release/runweaver
+```
+
+Tool startup time belongs to the tool, not to Runweaver.
 
 ## Outcome Contract
 
@@ -55,7 +143,7 @@ Git hook abort or restage behavior, CI annotations, or CLI exit status.
 
 ## Library And Binary Roles
 
-The library exposes the definition, manifest, runtime, service, surface, and
+The library exposes the definition, manifest, runtime, service, and
 embedded-binary primitives used by project-specific Runweaver integrations.
 
 The generic binary path is designed for projects to inject identity and
@@ -64,19 +152,10 @@ owns the reusable runtime and surface machinery; the project binary owns the
 project name, manifest location, builtin registry, and any repository-specific
 commands.
 
-## TypeScript Manifest Types
-
-`runweaver manifest types` writes `.runweaver/manifest.d.ts`, TypeScript
-declarations generated from the Rust manifest JSON schema. This codegen is the
-supported way to get manifest types into a consuming repo — there is no
-published npm package. The Rust schema is the single source of truth; rerun
-the command after upgrading `runweaver` to pick up schema changes (the
-`schema-sha256` stamp in the banner identifies the generating schema).
-
 ## More Context
 
-- `examples/` contains design examples and primitive evaluations. They import
-  from an aspirational `@bengous/runweaver` package that is not published;
-  real projects use the `.runweaver/manifest.d.ts` declarations generated by
-  `runweaver manifest types`.
+- `examples/` contains design documents and primitive evaluations, not a
+  runnable workflow. They import from an aspirational `@bengous/runweaver`
+  package that does not exist and is not published; the shipped authoring path
+  is the generated `.runweaver/manifest.d.ts` flow described above.
 - The crate-level rustdoc in `src/lib.rs` is the API map for library users.
