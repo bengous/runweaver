@@ -680,10 +680,10 @@ fn owned_command_prefixes(config: &HarnessHookConfigSet, target: &HarnessTarget)
     let mut prefixes = BTreeMap::from([(target.command_prefix.clone(), ())]);
     for hook in &config.hooks {
         for binding in &hook.bindings {
-            if binding.harness == target.harness {
-                if let Some(prefix) = &binding.command_prefix {
-                    prefixes.insert(prefix.clone(), ());
-                }
+            if binding.harness == target.harness
+                && let Some(prefix) = &binding.command_prefix
+            {
+                prefixes.insert(prefix.clone(), ());
             }
         }
     }
@@ -838,16 +838,15 @@ fn actual_claude_json_subset(
             subset.insert("hooks".to_owned(), Value::Object(hook_subset));
         }
     }
-    if target.options.contains_key("worktreeSymlinkDirectories") {
-        if let Some(symlink_directories) = root
+    if target.options.contains_key("worktreeSymlinkDirectories")
+        && let Some(symlink_directories) = root
             .get("worktree")
             .and_then(Value::as_object)
             .and_then(|worktree| worktree.get("symlinkDirectories"))
-        {
-            let mut worktree = Map::new();
-            worktree.insert("symlinkDirectories".to_owned(), symlink_directories.clone());
-            subset.insert("worktree".to_owned(), Value::Object(worktree));
-        }
+    {
+        let mut worktree = Map::new();
+        worktree.insert("symlinkDirectories".to_owned(), symlink_directories.clone());
+        subset.insert("worktree".to_owned(), Value::Object(worktree));
     }
     Ok(Value::Object(subset))
 }
