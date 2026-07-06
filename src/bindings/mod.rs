@@ -5,9 +5,9 @@
 //! [`Profile`] middleware. Bindings are composed with the [`bind`] builder
 //! and stored in order in a [`BindingRegistry`].
 //!
-//! At runtime, [`resolve_binding`] matches an incoming [`SurfaceEvent`]
-//! against the registry (exact surface/name/phase match) and
-//! [`run_bound_operation`] executes the result: profile `before_operation`
+//! At runtime, [`resolve_binding_trigger`] matches an incoming
+//! [`SurfaceTrigger`] against the registry (exact surface/name/phase match)
+//! and [`run_bound_operation`] executes the result: profile `before_operation`
 //! hooks run in declaration order, the operation runs, then
 //! `after_operation` hooks unwind in reverse order. If the operation fails,
 //! profile `on_operation_error` hooks may recover by returning a fallback
@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use crate::profiles::{Profile, ProfileError};
-use crate::surfaces::surface::{SurfaceEvent, SurfaceTrigger};
+use crate::surfaces::SurfaceTrigger;
 
 /// Ordered list of bindings; earlier entries win on trigger resolution.
 pub type BindingRegistry = Vec<Binding>;
@@ -179,12 +179,8 @@ pub fn validate_binding_registry(
     }
 }
 
-/// Matches an event's trigger against the registry; first exact
-/// surface/name/phase match wins.
-pub fn resolve_binding(registry: &[Binding], event: &SurfaceEvent) -> BindingResolution {
-    resolve_binding_trigger(registry, &event.trigger)
-}
-
+/// Matches a trigger against the registry; first exact surface/name/phase
+/// match wins.
 pub fn resolve_binding_trigger(
     registry: &[Binding],
     trigger: &SurfaceTrigger,
@@ -274,7 +270,7 @@ fn same_trigger(left: &SurfaceTrigger, right: &SurfaceTrigger) -> bool {
 mod tests {
     use super::*;
     use crate::profiles::{Profile, define_profile};
-    use crate::surfaces::surface::{SurfaceEvent, SurfaceTrigger};
+    use crate::surfaces::SurfaceTrigger;
 
     fn edit_trigger() -> SurfaceTrigger {
         SurfaceTrigger {
@@ -289,14 +285,6 @@ mod tests {
             surface: "agent-hook".to_owned(),
             name: "stop".to_owned(),
             phase: Some("before".to_owned()),
-        }
-    }
-
-    fn event(payload: Value) -> SurfaceEvent {
-        SurfaceEvent {
-            trigger: edit_trigger(),
-            payload,
-            metadata: None,
         }
     }
 
@@ -352,10 +340,7 @@ mod tests {
     #[test]
     fn exact_trigger_match_routes_to_executor_once() {
         let binding = bind(edit_trigger()).to("postEditFeedback").finish();
-        let resolution = resolve_binding(
-            &[binding],
-            &event(serde_json::json!({ "value": "payload" })),
-        );
+        let resolution = resolve_binding_trigger(&[binding], &edit_trigger());
         let mut context = serde_json::json!({});
 
         let result = run_resolved_binding(
@@ -378,10 +363,7 @@ mod tests {
     #[test]
     fn no_exact_trigger_match_returns_not_found_without_executor() {
         let binding = bind(stop_trigger()).to("stopValidation").finish();
-        let resolution = resolve_binding(
-            &[binding],
-            &event(serde_json::json!({ "value": "payload" })),
-        );
+        let resolution = resolve_binding_trigger(&[binding], &edit_trigger());
         let mut context = serde_json::json!({});
 
         let result = run_resolved_binding(

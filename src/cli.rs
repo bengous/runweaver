@@ -3,10 +3,9 @@
 //! The CLI fronts a project's automation: `run <task>`, `check`,
 //! `check hooks`, `check manifest`, `sync hooks`, `sync manifest`,
 //! `hook <harness> <command>`,
-//! `git-hook <slot>`, `init`, `install`, and `compile binary`. How
-//! configuration is sourced is abstracted behind [`RunweaverCliRuntime`]
-//! (loader/compiler ports) and all I/O behind [`RunweaverCliIo`], so the same
-//! dispatcher serves tests, the generic `runweaver` binary, and
+//! `git-hook <slot>`, `init`, `install`, and `compile binary`. All I/O is
+//! abstracted behind [`RunweaverCliIo`], so the same dispatcher serves tests,
+//! the generic `runweaver` binary ([`run_generic_runweaver_cli`]), and
 //! project-compiled binaries.
 //!
 //! [`CompiledRunweaverProject`] is the Rust-native project root: the full
@@ -15,8 +14,7 @@
 //! [`compiled_runweaver_project`] /
 //! [`CompiledRunweaverProjectBuilder`]. Project binaries hand it to
 //! [`run_compiled_runweaver_project_cli`] (or the `_with_compile` variant to
-//! also support `compile binary`); [`run_runweaver_cli`] is the fully
-//! port-driven entry point.
+//! also support `compile binary`).
 //!
 //! Exit codes: `0` on success, `1` when any task run blocks or a diagnostic
 //! error is reported. `--json` selects compact output (successful children
@@ -63,7 +61,7 @@ const MANIFEST_TYPES_DTS: &str = include_str!("../assets/manifest.d.ts");
 
 /// Loader and compiler ports the CLI dispatches through, decoupling command
 /// handling from how a project sources its config.
-pub struct RunweaverCliRuntime<'ports, 'config> {
+pub(crate) struct RunweaverCliRuntime<'ports, 'config> {
     pub load_runweaver_config: &'ports dyn for<'request> Fn(
         LoadRunweaverConfigRequest<'request>,
     ) -> Result<RunweaverConfig>,
@@ -305,14 +303,14 @@ pub struct RunweaverCliIo<'io> {
 /// the agent-facing view with successful children omitted, `Full`
 /// (`--json=full`) for the complete run tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunweaverJsonMode {
+pub(crate) enum RunweaverJsonMode {
     Off,
     Compact,
     Full,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunweaverParsedOptions {
+pub(crate) struct RunweaverParsedOptions {
     pub cwd: Option<String>,
     pub config_path: Option<String>,
     pub export_name: Option<String>,
@@ -328,7 +326,7 @@ pub struct RunweaverParsedOptions {
 /// Port-driven CLI entry point: dispatches `args` against the loaders and
 /// compiler in `runtime`. Diagnostic errors are rendered to stderr and map
 /// to exit code 1; other errors propagate.
-pub fn run_runweaver_cli(
+pub(crate) fn run_runweaver_cli(
     args: &[String],
     runtime: RunweaverCliRuntime<'_, '_>,
     mut io: RunweaverCliIo<'_>,
@@ -343,28 +341,6 @@ pub fn run_runweaver_cli(
             Err(error) => Err(error),
         },
     }
-}
-
-/// Runs the CLI against already-built Rust configs instead of loading authored config files.
-pub fn run_compiled_runweaver_cli<'config>(
-    args: &[String],
-    runweaver_config: &RunweaverConfig,
-    agent_hooks_config: Option<&AgentHooksConfig<'config>>,
-    io: RunweaverCliIo<'_>,
-) -> Result<i32> {
-    let compile = |_request: CompileRunweaverBinaryRequest<'_>| {
-        Err(anyhow!(
-            "compile binary is not available from in-process compiled config; build a project-specific Rust binary instead."
-        ))
-    };
-
-    run_compiled_runweaver_cli_with_compile(
-        args,
-        runweaver_config,
-        agent_hooks_config,
-        &compile,
-        io,
-    )
 }
 
 /// Runs the CLI against a compiled Rust project composition root.
@@ -415,45 +391,14 @@ pub fn run_compiled_runweaver_project_cli_with_compile<'config>(
     )
 }
 
-/// Runs the compiled CLI with a project-specific binary compiler for `compile binary`.
-pub fn run_compiled_runweaver_cli_with_compile<'config>(
-    args: &[String],
-    runweaver_config: &RunweaverConfig,
-    agent_hooks_config: Option<&AgentHooksConfig<'config>>,
-    compile_binary: &dyn for<'request> Fn(
-        CompileRunweaverBinaryRequest<'request>,
-    ) -> Result<CompileRunweaverBinaryResult>,
-    io: RunweaverCliIo<'_>,
-) -> Result<i32> {
-    let args = compiled_cli_args(args);
-    let load_config = |_request: LoadRunweaverConfigRequest<'_>| Ok(runweaver_config.clone());
-    let load_hooks = |_request: LoadRunweaverAgentHooksConfigRequest<'_>| {
-        agent_hooks_config.cloned().ok_or_else(|| {
-            anyhow!("Compiled Runweaver CLI was called without compiled agent hook config.")
-        })
-    };
-    let generated_surface_files = || Ok(Vec::new());
-    let git_surface = || Ok(None);
-
-    run_runweaver_cli(
-        &args,
-        RunweaverCliRuntime {
-            load_runweaver_config: &load_config,
-            load_agent_hooks_config: &load_hooks,
-            compile_binary,
-            generated_surface_files: &generated_surface_files,
-            git_surface: &git_surface,
-        },
-        io,
-    )
-}
-
 /// Loads a project for the generic `runweaver` binary: reads
 /// `.runweaver/manifest.json` under `root` and resolves it against the
 /// library's [`default_builtin_registry`](crate::config::default_builtin_registry).
 /// Manifests that reference builtins outside the default registry fail fast
 /// with a pointer to project-specific binaries.
-pub fn load_generic_runweaver_project(root: &Path) -> Result<CompiledRunweaverProject<'static>> {
+pub(crate) fn load_generic_runweaver_project(
+    root: &Path,
+) -> Result<CompiledRunweaverProject<'static>> {
     let manifest_path = root.join(".runweaver/manifest.json");
     let content = std::fs::read_to_string(&manifest_path).map_err(|error| {
         anyhow!(
@@ -561,7 +506,7 @@ fn cli_args_have_option(args: &[String], option: &str) -> bool {
     args.iter().any(|arg| arg == option)
 }
 
-pub fn parse_runweaver_options(args: &[String]) -> Result<RunweaverParsedOptions> {
+pub(crate) fn parse_runweaver_options(args: &[String]) -> Result<RunweaverParsedOptions> {
     let mut positionals = Vec::new();
     let mut files = Vec::new();
     let mut cwd = None;
@@ -651,7 +596,7 @@ pub fn parse_runweaver_options(args: &[String]) -> Result<RunweaverParsedOptions
     })
 }
 
-pub fn runweaver_help_text() -> &'static str {
+pub(crate) fn runweaver_help_text() -> &'static str {
     "runweaver <command>\n\nCommands:\n  init                Scaffold .runweaver/ managed toolchain files\n  install             Install .runweaver/package.json\n  check               Validate compiled config, scaffold, and managed toolchain\n  check hooks         Check generated native agent/git hook config drift\n  check manifest      Check .runweaver/manifest.json drift from stdin JSON\n  compile binary      Compile config + agent hooks into a project binary\n  sync hooks          Write generated native agent/git hook configs\n  sync manifest       Write .runweaver/manifest.json from stdin JSON\n  manifest schema     Write .runweaver/manifest.schema.json\n  manifest types      Write .runweaver/manifest.d.ts TypeScript declarations\n  git-hook <slot>     Execute a configured Git hook slot\n  hook <harness> <command>\n                      Execute a configured agent hook command from stdin\n  run <task>          Execute a named task or tool\n\nOptions:\n  --cwd <path>        Project root\n  --config <path>     Config path relative to cwd\n  --export <name>     Agent-hook config export for hook/sync/check hooks\n  --json[=compact|full]\n                      Print machine-readable JSON. Compact hides successful output.\n  --verbose           Include successful task stdout/stderr. With --json, emit full JSON.\n  --input-json <json|->\n                      Set ExecutionContext.input from a JSON string or stdin.\n  --out <path>        Output path for compile binary. Defaults to .runweaver/bin/runweaver.\n  --fingerprint <path>\n                      Add a source root to compiled binary freshness checks.\n  --file <path>       Add one ExecutionContext file\n  --files <paths>     Add comma-separated ExecutionContext files\n"
 }
 
@@ -2002,36 +1947,6 @@ mod tests {
     }
 
     #[test]
-    fn run_compiled_runweaver_cli_runs_tasks_without_dynamic_config_loader() {
-        let root = temp_root("compiled-run");
-        let config = runweaver_config();
-        let mut captured = CapturedIo::new();
-
-        let exit_code = run_compiled_runweaver_cli(
-            &args(&[
-                "run",
-                "echoInput",
-                "--cwd",
-                root.to_str().unwrap(),
-                "--json=full",
-                "--input-json",
-                r#"{"from":"compiled"}"#,
-            ]),
-            &config,
-            None,
-            captured.io(""),
-        )
-        .unwrap();
-
-        assert_eq!(exit_code, 0);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&captured.stdout()).unwrap()["data"],
-            serde_json::json!({ "from": "compiled" })
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn run_compiled_runweaver_project_cli_runs_tasks_from_compiled_project() {
         let root = temp_root("compiled-project-run");
         let task_config = runweaver_config();
@@ -2193,15 +2108,14 @@ mod tests {
     }
 
     #[test]
-    fn run_compiled_runweaver_cli_fails_closed_without_compiled_hook_config() {
+    fn run_compiled_runweaver_project_cli_fails_closed_without_compiled_hook_config() {
         let root = temp_root("compiled-hook-missing");
-        let config = runweaver_config();
+        let project = compiled_runweaver_project(runweaver_config()).build();
         let mut captured = CapturedIo::new();
 
-        let error = run_compiled_runweaver_cli(
+        let error = run_compiled_runweaver_project_cli(
             &args(&["hook", "custom", "guard", "--cwd", root.to_str().unwrap()]),
-            &config,
-            None,
+            &project,
             captured.io(r#"{"command":"pwd"}"#),
         )
         .unwrap_err();
@@ -2214,17 +2128,17 @@ mod tests {
     }
 
     #[test]
-    fn run_compiled_runweaver_cli_syncs_and_checks_hooks_without_config_arg() {
+    fn run_compiled_runweaver_project_cli_syncs_and_checks_hooks_without_config_arg() {
         let root = temp_root("compiled-hooks");
-        let config = runweaver_config();
-        let hooks = agent_hooks_config();
+        let project = compiled_runweaver_project(runweaver_config())
+            .agent_hooks_config(agent_hooks_config())
+            .build();
 
         let mut sync = CapturedIo::new();
         assert_eq!(
-            run_compiled_runweaver_cli(
+            run_compiled_runweaver_project_cli(
                 &args(&["sync", "hooks", "--cwd", root.to_str().unwrap()]),
-                &config,
-                Some(&hooks),
+                &project,
                 sync.io(""),
             )
             .unwrap(),
@@ -2234,10 +2148,9 @@ mod tests {
 
         let mut check = CapturedIo::new();
         assert_eq!(
-            run_compiled_runweaver_cli(
+            run_compiled_runweaver_project_cli(
                 &args(&["check", "hooks", "--cwd", root.to_str().unwrap()]),
-                &config,
-                Some(&hooks),
+                &project,
                 check.io(""),
             )
             .unwrap(),
@@ -2248,10 +2161,11 @@ mod tests {
     }
 
     #[test]
-    fn run_compiled_runweaver_cli_with_compile_delegates_without_config_or_export_arg() {
+    fn run_compiled_runweaver_project_cli_with_compile_delegates_without_config_or_export_arg() {
         let root = temp_root("compiled-compile");
-        let config = runweaver_config();
-        let hooks = agent_hooks_config();
+        let project = compiled_runweaver_project(runweaver_config())
+            .agent_hooks_config(agent_hooks_config())
+            .build();
         let compile_calls = Cell::new(0);
         let compile = |request: CompileRunweaverBinaryRequest<'_>| {
             compile_calls.set(compile_calls.get() + 1);
@@ -2267,7 +2181,7 @@ mod tests {
         };
         let mut captured = CapturedIo::new();
 
-        let exit_code = run_compiled_runweaver_cli_with_compile(
+        let exit_code = run_compiled_runweaver_project_cli_with_compile(
             &args(&[
                 "compile",
                 "binary",
@@ -2276,8 +2190,7 @@ mod tests {
                 "--fingerprint",
                 "src",
             ]),
-            &config,
-            Some(&hooks),
+            &project,
             &compile,
             captured.io(""),
         )
