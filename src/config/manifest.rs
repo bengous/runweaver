@@ -849,14 +849,11 @@ fn manifest_tool_args(
             .unwrap_or_else(|| tool.check_args.clone()),
     };
     let files = resolved_files(tool, mode, path_zones, ctx);
-    if tool.program == "cargo"
-        && matches!(mode, ToolRunMode::Fix)
-        && tool.fix_args == Some(vec!["fmt".to_owned()])
-    {
+    if tool.program == "cargo" && tool.fix_args == Some(vec!["fmt".to_owned()]) {
         if !ctx.files.is_empty() && files.is_empty() {
             return None;
         }
-        args.extend(cargo_fmt_fix_args(&files, ctx));
+        args.extend(cargo_fmt_args(&files, ctx, mode));
         append_input_args(&mut args, ctx);
         return Some(args);
     }
@@ -917,24 +914,31 @@ fn append_input_args(args: &mut Vec<String>, ctx: &super::ExecutionContext) {
     );
 }
 
-fn cargo_fmt_fix_args(files: &[String], ctx: &super::ExecutionContext) -> Vec<String> {
+fn cargo_fmt_args(
+    files: &[String],
+    ctx: &super::ExecutionContext,
+    mode: ToolRunMode,
+) -> Vec<String> {
     let mut args = vec!["fmt".to_owned()];
     if ctx.files.is_empty() {
         args.push("--all".to_owned());
-        return args;
-    }
-    let mut packages = BTreeSet::new();
-    for file in files {
-        if let Some(rest) = file.strip_prefix("crates/")
-            && let Some((package, _)) = rest.split_once('/')
-            && !package.is_empty()
-        {
-            packages.insert(package.to_owned());
+    } else {
+        let mut packages = BTreeSet::new();
+        for file in files {
+            if let Some(rest) = file.strip_prefix("crates/")
+                && let Some((package, _)) = rest.split_once('/')
+                && !package.is_empty()
+            {
+                packages.insert(package.to_owned());
+            }
+        }
+        for package in packages {
+            args.push("-p".to_owned());
+            args.push(package);
         }
     }
-    for package in packages {
-        args.push("-p".to_owned());
-        args.push(package);
+    if mode == ToolRunMode::Check {
+        args.extend(["--".to_owned(), "--check".to_owned()]);
     }
     args
 }
@@ -2560,10 +2564,25 @@ mod tests {
             ..PathZonesManifest::default()
         };
         let cargo_fmt = preset_tool("cargo-fmt", &[], None, &[]);
+        assert_eq!(
+            manifest_tool_args(
+                &cargo_fmt,
+                ToolRunMode::Check,
+                &zones,
+                &ExecutionContext::new(".")
+            ),
+            Some(strings(&["fmt", "--all", "--", "--check"]))
+        );
         let rust_ctx = ExecutionContext::new(".").with_files(vec![
             "crates/core-rs/src/lib.rs".to_owned(),
             "crates/demo-rs/src/main.rs".to_owned(),
         ]);
+        assert_eq!(
+            manifest_tool_args(&cargo_fmt, ToolRunMode::Check, &zones, &rust_ctx),
+            Some(strings(&[
+                "fmt", "-p", "core-rs", "-p", "demo-rs", "--", "--check"
+            ]))
+        );
         assert_eq!(
             manifest_tool_args(&cargo_fmt, ToolRunMode::Fix, &zones, &rust_ctx),
             Some(vec![
