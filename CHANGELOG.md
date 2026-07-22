@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- The manifest tool layer now supports `cargo fmt` check mode (`cargo fmt --
+  --check`), package-scoped with `-p <package>` when touched files map to
+  `crates/<package>/` and `--all` otherwise, aligning the manifest-driven
+  format gate with CI.
+
+### Removed
+
+- The `examples/` design-document directory: aspirational
+  `@bengous/runweaver` API sketches superseded by the shipped
+  `.runweaver/manifest.d.ts` codegen path.
+
 ## [0.2.0] - 2026-07-06
 
 ### Changed

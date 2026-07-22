@@ -154,8 +154,4 @@ commands.
 
 ## More Context
 
-- `examples/` contains design documents and primitive evaluations, not a
-  runnable workflow. They import from an aspirational `@bengous/runweaver`
-  package that does not exist and is not published; the shipped authoring path
-  is the generated `.runweaver/manifest.d.ts` flow described above.
 - The crate-level rustdoc in `src/lib.rs` is the API map for library users.
